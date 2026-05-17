@@ -5,6 +5,7 @@ This folder stores input data references for the watermarking pipeline.
 ## Structure
 
 - `host_images/`: host images used as cover images for watermark embedding.
+- `host_images_extract/`: images used for extraction-only mode.
 - `watermark/`: watermark assets (for example `cict.png`).
 
 ## Notes

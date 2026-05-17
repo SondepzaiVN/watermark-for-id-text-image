@@ -8,6 +8,112 @@ from scipy.fftpack import dct, idct
 from skimage.metrics import structural_similarity as ssim_func
 import pandas as pd
 
+
+def keypoints_to_array(keypoints):
+    if not keypoints:
+        return np.zeros((0, 7), dtype=np.float32)
+    rows = np.zeros((len(keypoints), 7), dtype=np.float32)
+    for i, kp in enumerate(keypoints):
+        rows[i] = [
+            kp.pt[0],
+            kp.pt[1],
+            kp.size,
+            kp.angle,
+            kp.response,
+            float(kp.octave),
+            float(kp.class_id),
+        ]
+    return rows
+
+
+def array_to_keypoints(rows):
+    if rows is None or len(rows) == 0:
+        return []
+    keypoints = []
+    for row in rows:
+        x, y, size, angle, response, octave, class_id = row
+        keypoints.append(
+            cv2.KeyPoint(
+                float(x),
+                float(y),
+                float(size),
+                float(angle),
+                float(response),
+                int(round(octave)),
+                int(round(class_id)),
+            )
+        )
+    return keypoints
+
+
+def save_key_file(
+    key_path,
+    pos,
+    safe_kp_orig,
+    safe_des_orig,
+    wm_shape,
+    orig_shape,
+    alpha,
+    seed,
+    mode,
+    text_input,
+    id_input,
+    repeat_k,
+    payload_repeat,
+    text_encoding,
+    host_path,
+    wm_raw_path,
+):
+    os.makedirs(os.path.dirname(key_path), exist_ok=True)
+    safe_des = safe_des_orig if safe_des_orig is not None else np.zeros((0, 1), dtype=np.float32)
+    np.savez_compressed(
+        key_path,
+        pos_kp=keypoints_to_array(pos),
+        safe_kp=keypoints_to_array(safe_kp_orig),
+        safe_des=safe_des,
+        wm_shape=np.array(wm_shape, dtype=np.int32),
+        orig_shape=np.array(orig_shape, dtype=np.int32),
+        alpha=np.array([alpha], dtype=np.float32),
+        seed=np.array([seed], dtype=np.int32),
+        mode=np.array([mode]),
+        text_input=np.array([text_input]),
+        id_input=np.array([id_input]),
+        repeat_k=np.array([repeat_k], dtype=np.int32),
+        payload_repeat=np.array([payload_repeat], dtype=np.int32),
+        text_encoding=np.array([text_encoding]),
+        host_path=np.array([host_path]),
+        wm_raw_path=np.array([wm_raw_path]),
+    )
+
+
+def load_key_file(key_path):
+    data = np.load(key_path, allow_pickle=True)
+    wm_shape = tuple(int(v) for v in data.get("wm_shape", []))
+    orig_shape = tuple(int(v) for v in data.get("orig_shape", []))
+    alpha = float(data.get("alpha", [0.0])[0])
+    seed = int(data.get("seed", [0])[0])
+    mode = str(data.get("mode", ["image"])[0])
+    repeat_k = int(data.get("repeat_k", [1])[0])
+    payload_repeat = int(data.get("payload_repeat", [1])[0])
+    text_encoding = str(data.get("text_encoding", ["utf-8"])[0])
+    return {
+        "pos": array_to_keypoints(data.get("pos_kp", np.zeros((0, 7), dtype=np.float32))),
+        "safe_kp_orig": array_to_keypoints(data.get("safe_kp", np.zeros((0, 7), dtype=np.float32))),
+        "safe_des_orig": data.get("safe_des", np.array([])),
+        "wm_shape": wm_shape,
+        "orig_shape": orig_shape,
+        "alpha": alpha,
+        "seed": seed,
+        "mode": mode,
+        "text_input": str(data.get("text_input", [""])[0]),
+        "id_input": str(data.get("id_input", [""])[0]),
+        "repeat_k": repeat_k,
+        "payload_repeat": payload_repeat,
+        "text_encoding": text_encoding,
+        "host_path": str(data.get("host_path", [""])[0]),
+        "wm_raw_path": str(data.get("wm_raw_path", [""])[0]),
+    }
+
 # --- 1. SCRAMBLING FUNCTIONS ---
 def redistribute_block(block, undo=False):
     m = block.shape[0]
@@ -426,6 +532,18 @@ def attack_jpeg(img, quality=50):
     _, encimg = cv2.imencode('.jpg', img, encode_param)
     return cv2.imdecode(encimg, 1)
 
+def attack_zalo_compress(img, quality=85, downscale=0.75):
+    """Approximate Zalo compression: downscale -> JPEG -> upscale."""
+    h, w = img.shape[:2]
+    scale = float(np.clip(downscale, 0.2, 1.0))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    _, encimg = cv2.imencode('.jpg', resized, encode_param)
+    decoded = cv2.imdecode(encimg, 1)
+    return cv2.resize(decoded, (w, h), interpolation=cv2.INTER_LINEAR)
+
 def attack_gaussian_filter(img, size=3, sigma=0.1):
     return cv2.GaussianBlur(img, (size, size), sigma)
 
@@ -527,6 +645,7 @@ def get_attack_scenarios():
         ("JPEG_QF90", lambda x: attack_jpeg(x, 90)),
         ("JPEG_Q80", lambda x: attack_jpeg(x, 80)),
         ("JPEG_Q70", lambda x: attack_jpeg(x, 70)),
+        ("ZaloCompress_Q85_S0.75", lambda x: attack_zalo_compress(x, 85, 0.75)),
         ("SaltPepper_0.01", lambda x: attack_salt_pepper(x, 0.01)),
         ("SaltPepperNoise_0.01", lambda x: attack_salt_pepper(x, 0.01)),
         ("SaltPepper_0.05", lambda x: attack_salt_pepper(x, 0.05)),
@@ -1139,6 +1258,33 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
         # alpha_val = 100.0  # Embedding strength (higher value improves robustness)
         # cv2.imwrite('wtm.jpg', wm)
         wat, _, pos, safe_des_orig, safe_kp_orig = embed_watermark(host, wm, alpha_val, N, seed)
+        key_path = os.path.join("results", f"{host_name}.npz")
+        save_key_file(
+            key_path,
+            pos=pos,
+            safe_kp_orig=safe_kp_orig,
+            safe_des_orig=safe_des_orig,
+            wm_shape=wm.shape,
+            orig_shape=(orig_h, orig_w),
+            alpha=alpha_val,
+            seed=seed,
+            mode=MODE,
+            text_input=text_input,
+            id_input=id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            text_encoding=text_encoding,
+            host_path=host_path,
+            wm_raw_path=wm_raw_path,
+        )
+        print(f"[*] Key saved: {key_path}")
+        extract_dir = os.path.join("data", "host_images_extract")
+        os.makedirs(extract_dir, exist_ok=True)
+        host_filename = os.path.basename(host_path)
+        extract_path = os.path.join(extract_dir, host_filename)
+        cv2.imwrite(extract_path, wat)
+        print(f"[*] Saved no-attack image: {extract_path}")
+
         attacks = get_attack_scenarios()
 
         print(f"\n{'Attack':<25} | {'PSNR':<8.2} | {'SSIM':<8.4} | {'NC':<8.4} | {'BER':<8.4}")
@@ -1220,3 +1366,131 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
         print(f"  - Attacked images: {attack_dir}")
         print(f"  - Recovered images: {recover_dir}")
         print(f"[*] Updated results for host image '{host_name}' in file: {excel_final_path}")
+
+
+def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
+    host = cv2.imread(host_path)
+    if host is None:
+        raise ValueError(f"Unable to read image: {host_path}")
+
+    key = load_key_file(key_path)
+    if not key["wm_shape"] or not key["orig_shape"]:
+        raise ValueError(f"Key missing wm_shape/orig_shape: {key_path}")
+
+    os.makedirs(output_dir, exist_ok=True)
+    attack_dir = os.path.join(output_dir, "attack")
+    recover_dir = os.path.join(output_dir, "recover")
+    os.makedirs(attack_dir, exist_ok=True)
+    os.makedirs(recover_dir, exist_ok=True)
+
+    orig_host = None
+    if key["host_path"]:
+        orig_host = cv2.imread(key["host_path"])
+        if orig_host is None:
+            print(f"[!] Original host not found: {key['host_path']}")
+
+    if key["mode"] == "text":
+        if not key.get("text_input"):
+            raise ValueError("Missing text_input in key file.")
+        wm_bin_raw = text_to_bin_image(
+            key.get("text_input", ""),
+            repeat_k=key["repeat_k"],
+            payload_repeat=key["payload_repeat"],
+            encoding=key["text_encoding"],
+        )
+        wm_orig_bin = wm_bin_raw
+    elif key["mode"] == "id":
+        if not key.get("id_input"):
+            raise ValueError("Missing id_input in key file.")
+        wm_bin_raw = id_to_bin_image(
+            key.get("id_input", ""),
+            repeat_k=key["repeat_k"],
+            payload_repeat=key["payload_repeat"],
+        )
+        wm_orig_bin = wm_bin_raw
+    else:
+        wm_raw_path = key.get("wm_raw_path", "")
+        wm_raw = cv2.imread(wm_raw_path, cv2.IMREAD_GRAYSCALE) if wm_raw_path else None
+        if wm_raw is None:
+            raise ValueError(f"Unable to read watermark image: {wm_raw_path}")
+        wm_orig_bin = (wm_raw > 127).astype(np.uint8)
+
+    orig_h, orig_w = key["orig_shape"]
+
+    print(f"[*] Affine correction mode: {'ON' if use_affine_correction else 'OFF'}")
+    print(f"\n{'Attack':<25} | {'PSNR':<8.2} | {'SSIM':<8.4} | {'NC':<8.4} | {'BER':<8.4}")
+    print("-" * 55)
+
+    results_list = []
+    attacks = get_attack_scenarios()
+    for name, func in attacks:
+        att_img = func(host)
+        cv2.imwrite(os.path.join(attack_dir, f"attack_{name}.png"), att_img)
+        ext_padded = extract_watermark(
+            att_img,
+            key["safe_des_orig"],
+            key["safe_kp_orig"],
+            key["alpha"],
+            key["pos"],
+            key["wm_shape"],
+            seed=key["seed"],
+            use_affine_correction=use_affine_correction,
+        )
+        ext = ext_padded[:orig_h, :orig_w]
+
+        if orig_host is not None:
+            psnr, ssim, nc, ber = evaluate(orig_host, att_img, wm_orig_bin, ext)
+        else:
+            psnr, ssim, nc, ber = 0.0, 0.0, 0.0, 1.0
+
+        row = {
+            "Attack": name,
+            "Alpha": round(float(key["alpha"]), 4),
+            "PSNR": round(psnr, 4),
+            "SSIM": round(ssim, 4),
+            "NC": round(nc, 4),
+            "BER": round(ber, 4),
+        }
+
+        if key["mode"] == "text":
+            extracted_text = bin_image_to_text(
+                ext,
+                repeat_k=key["repeat_k"],
+                payload_repeat=key["payload_repeat"],
+                encoding=key["text_encoding"],
+            )
+            extracted_text_clean = sanitize_excel_text(extracted_text)
+            row["ExtractedText"] = extracted_text_clean
+            print(
+                f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f} | "
+                f"Extracted text: {extracted_text_clean}"
+            )
+        elif key["mode"] == "id":
+            extracted_id = bin_image_to_id(
+                ext,
+                repeat_k=key["repeat_k"],
+                payload_repeat=key["payload_repeat"],
+            )
+            extracted_id_clean = sanitize_excel_text(extracted_id)
+            row["ExtractedID"] = extracted_id_clean
+            print(
+                f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f} | "
+                f"Extracted id: {extracted_id_clean}"
+            )
+        else:
+            print(f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f}")
+
+        results_list.append(row)
+        cv2.imwrite(os.path.join(recover_dir, f"recovered_{name}.png"), ext * 255)
+
+    df = pd.DataFrame(results_list)
+    metrics_path = os.path.join(output_dir, "extract_metrics.xlsx")
+    with pd.ExcelWriter(metrics_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="extract", index=False)
+
+    print("-" * 55)
+    print(f"Results were saved to '{output_dir}/'.")
+    print(f"  - Attacked images: {attack_dir}")
+    print(f"  - Recovered images: {recover_dir}")
+    print(f"[*] Extract metrics saved: {metrics_path}")
+    return metrics_path

@@ -28,6 +28,7 @@ Primary goals:
 |-- data/
 |   |-- README.md
 |   |-- host_images/                 # host images used as cover images
+|   |-- host_images_extract/         # images used for extraction-only mode
 |   `-- watermark/                   # watermark assets (default: cict.png)
 |-- models/
 |   |-- README.md
@@ -126,7 +127,7 @@ Main CLI parameters:
 
 - --img-dir: directory containing host images
 - --wm-raw: watermark image path (image mode)
-- --mode: image, text, or id
+- --mode: image, text, id, or extract
 - --text-input: watermark text (text mode, UTF-8)
 - --id-input: numeric ID (id mode, digits only)
 - --text-encoding: text encoding for text mode (default: utf-8)
@@ -202,6 +203,7 @@ Global summary files:
 
 - results/watermark_binary.jpg
 - results/watermark_evaluation_summary.xlsx
+- results/<host_name>.npz (key file for extraction)
 
 Metrics reported:
 

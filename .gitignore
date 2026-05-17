@@ -26,5 +26,7 @@ build/
 dist/
 *.egg-info/
 
+host_images_extract/
+
 # Results
 results/

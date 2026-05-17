@@ -8,6 +8,7 @@ if PROJECT_ROOT not in sys.path:
 
 from models.watermark_pipeline import (
     main,
+    extract_only,
     optimize_alpha_bayesian,
     estimate_bit_error_rate,
     choose_repeat_k_from_ber,
@@ -26,6 +27,11 @@ def build_parser():
     )
     parser.add_argument("--img-dir", default="data/host_images", help="Directory containing host images.")
     parser.add_argument(
+        "--img-path",
+        default=None,
+        help="Single image path to process (overrides --img-dir).",
+    )
+    parser.add_argument(
         "--wm-raw",
         default="data/watermark/cict.png",
         help="Path to watermark image when mode=image.",
@@ -33,8 +39,8 @@ def build_parser():
     parser.add_argument(
         "--mode",
         default="image",
-        choices=["image", "text", "id"],
-        help="Watermark mode: image, text, or id.",
+        choices=["image", "text", "id", "extract"],
+        help="Watermark mode: image, text, id, or extract.",
     )
     parser.add_argument("--text-input", default="Hello World", help="Watermark text when mode=text.")
     parser.add_argument("--id-input", default="012345678910", help="Watermark ID when mode=id.")
@@ -103,30 +109,47 @@ def build_parser():
     return parser
 
 
-def prompt_if_missing_args(mode, text_input, id_input):
+def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path):
     if "--mode" in sys.argv:
-        return mode, text_input, id_input
+        selected_mode = mode
+    else:
+        print("Select watermark mode:")
+        print("  1) image")
+        print("  2) text")
+        print("  3) id")
+        print("  4) extract")
+        choice = input("Enter choice [1-4] (default=1): ").strip()
 
-    print("Select watermark mode:")
-    print("  1) image")
-    print("  2) text")
-    print("  3) id")
-    choice = input("Enter choice [1-3] (default=1): ").strip()
+        mode_map = {"1": "image", "2": "text", "3": "id", "4": "extract"}
+        selected_mode = mode_map.get(choice, "image")
 
-    mode_map = {"1": "image", "2": "text", "3": "id"}
-    mode = mode_map.get(choice, "image")
-
-    if mode == "text" and "--text-input" not in sys.argv:
+    if selected_mode == "text" and "--text-input" not in sys.argv:
         user_text = input(f"Enter text (default='{text_input}'): ").strip()
         if user_text:
             text_input = user_text
 
-    if mode == "id" and "--id-input" not in sys.argv:
+    if selected_mode == "id" and "--id-input" not in sys.argv:
         user_id = input(f"Enter numeric ID (default='{id_input}'): ").strip()
         if user_id:
             id_input = user_id
 
-    return mode, text_input, id_input
+    if selected_mode == "extract" and "--img-dir" not in sys.argv and img_path is None:
+        img_dir = "data/host_images_extract"
+
+    if "--img-path" not in sys.argv and "--img-dir" not in sys.argv:
+        print("Select input scope:")
+        print("  0) directory")
+        print("  1) single image")
+        scope = input("Enter choice [0-1] (default=0): ").strip()
+        if scope == "1":
+            if not os.path.isdir(img_dir):
+                print(f"[!] Input directory not found: {img_dir}")
+            else:
+                img_name = input(f"Enter image filename in '{img_dir}': ").strip()
+                if img_name:
+                    img_path = os.path.join(img_dir, img_name)
+
+    return selected_mode, text_input, id_input, img_dir, img_path
 
 
 if __name__ == "__main__":
@@ -134,6 +157,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     img_dir = args.img_dir
+    img_path = args.img_path
     wm_raw = args.wm_raw
     MODE = args.mode
     text_input = args.text_input
@@ -154,26 +178,61 @@ if __name__ == "__main__":
     auto_optimize_alpha_per_image = args.auto_optimize_alpha_per_image
     use_affine_correction = args.use_affine_correction
 
-    MODE, text_input, id_input = prompt_if_missing_args(MODE, text_input, id_input)
+    MODE, text_input, id_input, img_dir, img_path = prompt_if_missing_args(
+        MODE, text_input, id_input, img_dir, img_path
+    )
 
-    if not os.path.isdir(img_dir):
-        print(f"[!] Input directory not found: {img_dir}")
-        raise SystemExit(1)
+    if (
+        MODE == "extract"
+        and args.img_dir == "data/host_images"
+        and "--img-dir" not in sys.argv
+        and img_path is None
+    ):
+        img_dir = "data/host_images_extract"
+
+    if img_path is None:
+        if not os.path.isdir(img_dir):
+            print(f"[!] Input directory not found: {img_dir}")
+            raise SystemExit(1)
+    else:
+        if not os.path.isfile(img_path):
+            print(f"[!] Input image not found: {img_path}")
+            raise SystemExit(1)
 
     if MODE == "image" and not os.path.isfile(wm_raw):
         print(f"[!] Watermark image not found: {wm_raw}")
         raise SystemExit(1)
 
-    all_img_paths = sorted(
-        [
-            os.path.join(img_dir, img_file)
-            for img_file in os.listdir(img_dir)
-            if os.path.isfile(os.path.join(img_dir, img_file))
-        ]
-    )
+    if img_path is None:
+        all_img_paths = sorted(
+            [
+                os.path.join(img_dir, img_file)
+                for img_file in os.listdir(img_dir)
+                if os.path.isfile(os.path.join(img_dir, img_file))
+            ]
+        )
+    else:
+        all_img_paths = [img_path]
 
     if len(all_img_paths) == 0:
         print("[!] No input images found in the directory.")
+        raise SystemExit(0)
+
+    if MODE == "extract":
+        for img_path in all_img_paths:
+            img_name = os.path.splitext(os.path.basename(img_path))[0]
+            key_path = os.path.join("results", f"{img_name}.npz")
+            if not os.path.isfile(key_path):
+                print(f"[!] Key not found for {img_name}: {key_path}")
+                continue
+            output_dir = os.path.join("results", img_name, "extract")
+            print(f"Extracting: {img_name}")
+            extract_only(
+                img_path,
+                key_path,
+                output_dir,
+                use_affine_correction=use_affine_correction,
+            )
         raise SystemExit(0)
 
     global_alpha = alpha
