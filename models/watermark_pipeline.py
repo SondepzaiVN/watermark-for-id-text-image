@@ -160,7 +160,6 @@ def calculate_entropy(roi):
     marg = marg[marg > 0] # Remove zeros to avoid log issues
     return -np.sum(marg * np.log2(marg))
 
-# COEFF_POS = [(1,0), (0,1), (0,2), (1,1), (2,0), (3,0), (2,1), (1,2)]
 COEFF_POS = [(1, 1)]
 
 JPEG_GRID_SIZE = 8
@@ -896,7 +895,16 @@ def bits_to_square_matrix(bit_array, min_side=32):
     side = max(side, min_side)
 
     total_pixels = side * side
-    bit_array = np.pad(bit_array, (0, total_pixels - len(bit_array)), 'constant')
+    if len(bit_array) < total_pixels and len(bit_array) > 0:
+        reps = int(np.ceil(total_pixels / len(bit_array)))
+        bit_array = np.tile(bit_array, reps)[:total_pixels]
+    else:
+        # If empty or already large enough, pad/truncate as before
+        if len(bit_array) < total_pixels:
+            bit_array = np.pad(bit_array, (0, total_pixels - len(bit_array)), 'constant')
+        else:
+            bit_array = bit_array[:total_pixels]
+
     return bit_array.reshape((side, side))
 
 def get_text_payload_bits_len(text, encoding="utf-8"):
@@ -962,6 +970,64 @@ def bit_string_to_bytes(bit_str):
             break
         data.append(int(chunk, 2))
     return bytes(data)
+
+def text_to_payload_bits(text, encoding="utf-8"):
+    payload = text.encode(encoding)
+    payload_len = len(payload)
+    if payload_len > 65535:
+        raise ValueError("Text payload too long for 16-bit length header.")
+    header = format(payload_len, '016b')
+    return header + bytes_to_bit_string(payload)
+
+def id_to_payload_bits(id_text):
+    if id_text is None:
+        raise ValueError("ID input is required for mode=id.")
+    if len(id_text) == 0:
+        raise ValueError("ID input cannot be empty.")
+    if not id_text.isdigit():
+        raise ValueError("ID input must contain digits only (0-9).")
+    digits = [int(ch) for ch in id_text]
+    bits = ''.join(format(d, '04b') for d in digits)
+    return bits + '1111'
+
+def payload_bits_from_bin_image_text(bin_img, repeat_k=3, payload_repeat=1):
+    bits = bin_img.flatten()
+    decoded_bits = decode_repeated_bits(bits, repeat_k)
+    bit_str = ''.join(map(str, decoded_bits))
+    if payload_repeat < 1 or len(bit_str) < 16:
+        return ""
+
+    header_bits = bit_str[:16]
+    payload_len = int(header_bits, 2)
+    copy_len = 16 + payload_len * 8
+    if payload_repeat > 1 and copy_len > 0:
+        bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
+    return bit_str[:copy_len]
+
+def payload_bits_from_bin_image_id(bin_img, repeat_k=1, payload_repeat=1):
+    bits = bin_img.flatten()
+    decoded_bits = decode_repeated_bits(bits, repeat_k)
+    bit_str = ''.join(map(str, decoded_bits))
+    if payload_repeat < 1:
+        return ""
+
+    _, copy_len = decode_id_bits(bit_str)
+    if payload_repeat > 1 and copy_len > 0:
+        bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
+    return bit_str[:copy_len]
+
+def payload_ber(orig_bits, extracted_bits):
+    if orig_bits is None:
+        orig_bits = ""
+    if extracted_bits is None:
+        extracted_bits = ""
+    n = len(orig_bits)
+    if n == 0:
+        return 0.0
+    compare_len = min(n, len(extracted_bits))
+    errors = sum(1 for i in range(compare_len) if orig_bits[i] != extracted_bits[i])
+    missing = n - compare_len
+    return float(errors + missing) / float(n)
 
 def text_to_bin_image(text, repeat_k=3, payload_repeat=1, encoding="utf-8"):
     """Convert text to bits (UTF-8 by default) and repeat each bit for robustness."""
@@ -1116,6 +1182,39 @@ def evaluate(orig, wat, wm, ext_wm):
     ber = np.sum(wm_bin != ext_bin) / wm_bin.size
 
     return psnr, ssim_val, nc, ber
+
+
+def char_accuracy(orig_text, extracted_text):
+    """Compute character-level accuracy using Levenshtein distance.
+    Returns fraction in [0.0, 1.0]."""
+    if orig_text is None:
+        orig_text = ""
+    if extracted_text is None:
+        extracted_text = ""
+    s = str(orig_text)
+    t = str(extracted_text)
+    n = len(s)
+    m = len(t)
+    if n == 0 and m == 0:
+        return 1.0
+    # DP table
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            cost = 0 if s[i - 1] == t[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    lev = dp[n][m]
+    maxlen = max(n, 1)
+    acc = max(0.0, 1.0 - float(lev) / float(maxlen))
+    return acc
 
 
 def estimate_bit_error_rate(host_paths, wm_bin, alpha_val, N, seed,
@@ -1327,18 +1426,39 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                     encoding=text_encoding,
                 )
                 extracted_text_clean = sanitize_excel_text(extracted_text)
+                # Character-level accuracy vs input
+                char_acc = char_accuracy(text_input, extracted_text_clean)
+                orig_bits = text_to_payload_bits(text_input, encoding=text_encoding)
+                extracted_bits = payload_bits_from_bin_image_text(
+                    ext,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                )
+                bit_ber = payload_ber(orig_bits, extracted_bits)
                 row["ExtractedText"] = extracted_text_clean
+                row["CharAcc"] = round(float(char_acc), 4)
+                row["PayloadBER"] = round(float(bit_ber), 4)
                 print(
                     f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f} | "
-                    f"Extracted text: {extracted_text_clean}"
+                    f"Extracted text: {extracted_text_clean} | CharAcc: {char_acc:.4f} | PayloadBER: {bit_ber:.4f}"
                 )
             elif MODE == "id":
                 extracted_id = bin_image_to_id(ext, repeat_k=repeat_k, payload_repeat=payload_repeat)
                 extracted_id_clean = sanitize_excel_text(extracted_id)
+                char_acc = char_accuracy(id_input, extracted_id_clean)
+                orig_bits = id_to_payload_bits(id_input)
+                extracted_bits = payload_bits_from_bin_image_id(
+                    ext,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                )
+                bit_ber = payload_ber(orig_bits, extracted_bits)
                 row["ExtractedID"] = extracted_id_clean
+                row["CharAcc"] = round(float(char_acc), 4)
+                row["PayloadBER"] = round(float(bit_ber), 4)
                 print(
                     f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f} | "
-                    f"Extracted id: {extracted_id_clean}"
+                    f"Extracted id: {extracted_id_clean} | CharAcc: {char_acc:.4f} | PayloadBER: {bit_ber:.4f}"
                 )
             else:
                 print(f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f}")
@@ -1460,10 +1580,20 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
                 encoding=key["text_encoding"],
             )
             extracted_text_clean = sanitize_excel_text(extracted_text)
+            char_acc = char_accuracy(key.get("text_input", ""), extracted_text_clean)
+            orig_bits = text_to_payload_bits(key.get("text_input", ""), encoding=key["text_encoding"])
+            extracted_bits = payload_bits_from_bin_image_text(
+                ext,
+                repeat_k=key["repeat_k"],
+                payload_repeat=key["payload_repeat"],
+            )
+            bit_ber = payload_ber(orig_bits, extracted_bits)
             row["ExtractedText"] = extracted_text_clean
+            row["CharAcc"] = round(float(char_acc), 4)
+            row["PayloadBER"] = round(float(bit_ber), 4)
             print(
                 f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f} | "
-                f"Extracted text: {extracted_text_clean}"
+                f"Extracted text: {extracted_text_clean} | CharAcc: {char_acc:.4f} | PayloadBER: {bit_ber:.4f}"
             )
         elif key["mode"] == "id":
             extracted_id = bin_image_to_id(
@@ -1472,10 +1602,20 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
                 payload_repeat=key["payload_repeat"],
             )
             extracted_id_clean = sanitize_excel_text(extracted_id)
+            char_acc = char_accuracy(key.get("id_input", ""), extracted_id_clean)
+            orig_bits = id_to_payload_bits(key.get("id_input", ""))
+            extracted_bits = payload_bits_from_bin_image_id(
+                ext,
+                repeat_k=key["repeat_k"],
+                payload_repeat=key["payload_repeat"],
+            )
+            bit_ber = payload_ber(orig_bits, extracted_bits)
             row["ExtractedID"] = extracted_id_clean
+            row["CharAcc"] = round(float(char_acc), 4)
+            row["PayloadBER"] = round(float(bit_ber), 4)
             print(
                 f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f} | "
-                f"Extracted id: {extracted_id_clean}"
+                f"Extracted id: {extracted_id_clean} | CharAcc: {char_acc:.4f} | PayloadBER: {bit_ber:.4f}"
             )
         else:
             print(f"{name:<25} | {psnr:<8.2f} | {ssim:<8.4f} | {nc:<8.4f} | {ber:<8.4f}")

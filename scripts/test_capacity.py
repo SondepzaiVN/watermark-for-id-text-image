@@ -22,6 +22,9 @@ from models.watermark_pipeline import (
 )
 
 
+SUGGESTED_CAPACITY_BITS = [10000, 20000, 30000]
+
+
 def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payload_repeat, repeat_k_before_fill, repeat_k_after_fill):
     if mode not in ("text", "id"):
         return
@@ -63,7 +66,7 @@ def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payloa
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Run robust watermarking experiments on host images."
+        description="Run robust watermarking experiments with capacity selection."
     )
     parser.add_argument("--img-dir", default="data/host_images", help="Directory containing host images.")
     parser.add_argument(
@@ -89,6 +92,12 @@ def build_parser():
         default="utf-8",
         choices=["ascii", "utf-8"],
         help="Text encoding for mode=text. Note: UTF-8 can store Vietnamese characters.",
+    )
+    parser.add_argument(
+        "--target-bits",
+        type=int,
+        default=None,
+        help="Target total embedded bits (after repeat_k and payload_repeat).",
     )
     parser.add_argument("--repeat-k", type=int, default=3, help="Bit repetition factor (odd number).")
     parser.add_argument("--payload-repeat", type=int, default=1, help="Payload repetition factor.")
@@ -159,7 +168,7 @@ def build_parser():
     return parser
 
 
-def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path, text_encoding):
+def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path, text_encoding, target_bits):
     if "--mode" in sys.argv:
         selected_mode = mode
     else:
@@ -173,6 +182,15 @@ def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path, text_e
         mode_map = {"1": "image", "2": "text", "3": "id", "4": "extract"}
         selected_mode = mode_map.get(choice, "image")
 
+    input_strategy = "manual"
+    if selected_mode in ("text", "id"):
+        print("Select payload input:")
+        print("  1) manual input")
+        print("  2) auto-generate to match capacity")
+        strategy_choice = input("Enter choice [1-2] (default=1): ").strip()
+        if strategy_choice == "2":
+            input_strategy = "auto"
+
     # Prompt for text encoding when in text mode and not provided via CLI
     if selected_mode == "text" and "--text-encoding" not in sys.argv:
         print("Select text encoding:")
@@ -184,12 +202,15 @@ def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path, text_e
         if text_encoding.lower() == "utf-8":
             print("[*] Note: UTF-8 can store Vietnamese characters.")
 
-    if selected_mode == "text" and "--text-input" not in sys.argv:
+    if target_bits is None and selected_mode in ("text", "id") and "--target-bits" not in sys.argv:
+        target_bits = prompt_capacity_bits(selected_mode, SUGGESTED_CAPACITY_BITS[0])
+
+    if selected_mode == "text" and input_strategy == "manual" and "--text-input" not in sys.argv:
         user_text = input(f"Enter text (default='{text_input}'): ").strip()
         if user_text:
             text_input = user_text
 
-    if selected_mode == "id" and "--id-input" not in sys.argv:
+    if selected_mode == "id" and input_strategy == "manual" and "--id-input" not in sys.argv:
         user_id = input(f"Enter numeric ID (default='{id_input}'): ").strip()
         if user_id:
             id_input = user_id
@@ -210,7 +231,66 @@ def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path, text_e
                 if img_name:
                     img_path = os.path.join(img_dir, img_name)
 
-    return selected_mode, text_input, id_input, img_dir, img_path, text_encoding
+    return selected_mode, text_input, id_input, img_dir, img_path, text_encoding, input_strategy, target_bits
+
+
+def prompt_capacity_bits(mode, default_bits):
+    if mode not in ("text", "id"):
+        return None
+
+    print("Select target embedded bits (after repeat_k and payload_repeat):")
+    for idx, bits in enumerate(SUGGESTED_CAPACITY_BITS, 1):
+        print(f"  {idx}) {bits}")
+    print("  0) custom")
+    choice = input(f"Enter choice [0-{len(SUGGESTED_CAPACITY_BITS)}] (default=1): ").strip()
+    if choice == "0":
+        custom = input("Enter target bits (e.g., 15000): ").strip()
+        if custom.isdigit() and int(custom) > 0:
+            return int(custom)
+        return default_bits
+
+    if choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(SUGGESTED_CAPACITY_BITS):
+            return SUGGESTED_CAPACITY_BITS[idx - 1]
+
+    return default_bits
+
+
+def build_text_for_capacity(target_bits, repeat_k, payload_repeat, encoding):
+    if target_bits is None or target_bits <= 0:
+        return None
+    raw_bits = max(int(target_bits // max(repeat_k * payload_repeat, 1)), 16)
+    bytes_len = max(int((raw_bits - 16) // 8), 1)
+    text = "A" * bytes_len
+    # Ensure encoding length matches
+    while len(text.encode(encoding)) > bytes_len and bytes_len > 1:
+        bytes_len -= 1
+        text = "A" * bytes_len
+    return text
+
+
+def build_id_for_capacity(target_bits, repeat_k, payload_repeat):
+    if target_bits is None or target_bits <= 0:
+        return None
+    raw_bits = max(int(target_bits // max(repeat_k * payload_repeat, 1)), 4)
+    digits_len = max(int((raw_bits - 4) // 4), 1)
+    return "1" * digits_len
+
+
+def report_capacity(mode, text_input, id_input, repeat_k, payload_repeat, text_encoding):
+    if mode == "text":
+        base_bits_len = get_text_payload_bits_len(text_input, encoding=text_encoding)
+    elif mode == "id":
+        base_bits_len = get_id_payload_bits_len(id_input)
+    else:
+        return
+
+    protected_bits = base_bits_len * repeat_k * payload_repeat
+    print(
+        f"[*] Payload bits: base={base_bits_len}, repeat_k={repeat_k}, payload_repeat={payload_repeat} "
+        f"-> total_protected_bits={protected_bits}"
+    )
 
 
 if __name__ == "__main__":
@@ -224,6 +304,7 @@ if __name__ == "__main__":
     text_input = args.text_input
     id_input = args.id_input
     text_encoding = args.text_encoding
+    target_bits = args.target_bits
     repeat_k = args.repeat_k
     payload_repeat = args.payload_repeat
     auto_repeat_k = args.auto_repeat_k
@@ -239,8 +320,8 @@ if __name__ == "__main__":
     auto_optimize_alpha_per_image = args.auto_optimize_alpha_per_image
     use_affine_correction = args.use_affine_correction
 
-    MODE, text_input, id_input, img_dir, img_path, text_encoding = prompt_if_missing_args(
-        MODE, text_input, id_input, img_dir, img_path, text_encoding
+    MODE, text_input, id_input, img_dir, img_path, text_encoding, input_strategy, target_bits = prompt_if_missing_args(
+        MODE, text_input, id_input, img_dir, img_path, text_encoding, target_bits
     )
 
     if (
@@ -320,6 +401,18 @@ if __name__ == "__main__":
         )
         print(f"[*] Auto repeat-k: ber={ber} -> repeat_k={repeat_k}")
 
+    if MODE == "text" and input_strategy == "auto" and target_bits:
+        auto_text = build_text_for_capacity(target_bits, repeat_k, payload_repeat, text_encoding)
+        if auto_text:
+            text_input = auto_text
+            print(f"[*] Auto-generated text length={len(text_input)} to fit target_bits={target_bits}")
+
+    if MODE == "id" and input_strategy == "auto" and target_bits:
+        auto_id = build_id_for_capacity(target_bits, repeat_k, payload_repeat)
+        if auto_id:
+            id_input = auto_id
+            print(f"[*] Auto-generated ID length={len(id_input)} to fit target_bits={target_bits}")
+
     repeat_k_before_fill = repeat_k
     if MODE in ("text", "id") and (fill_repeat_k or fill_repeat_payload):
         if MODE == "text":
@@ -347,6 +440,7 @@ if __name__ == "__main__":
         print(f"[*] Fill strategy -> repeat_k={repeat_k}, payload_repeat={payload_repeat}")
 
     if MODE in ("text", "id"):
+        report_capacity(MODE, text_input, id_input, repeat_k, payload_repeat, text_encoding)
         save_fill_k_preview_images(
             MODE,
             text_input,
@@ -430,4 +524,3 @@ if __name__ == "__main__":
             seed,
             use_affine_correction=use_affine_correction,
         )
-
