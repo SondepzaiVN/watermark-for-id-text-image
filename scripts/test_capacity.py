@@ -25,7 +25,7 @@ from models.watermark_pipeline import (
 SUGGESTED_CAPACITY_BITS = [10000, 20000, 30000]
 
 
-def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payload_repeat, repeat_k_before_fill, repeat_k_after_fill):
+def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payload_repeat, repeat_k_before_fill, repeat_k_after_fill, payload_seed):
     if mode not in ("text", "id"):
         return
 
@@ -39,23 +39,27 @@ def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payloa
             repeat_k=repeat_k_before_fill,
             payload_repeat=payload_repeat,
             encoding=text_encoding,
+            payload_seed=payload_seed,
         )
         wm_after = text_to_bin_image(
             text_input,
             repeat_k=repeat_k_after_fill,
             payload_repeat=payload_repeat,
             encoding=text_encoding,
+            payload_seed=payload_seed,
         )
     else:
         wm_before = id_to_bin_image(
             id_input,
             repeat_k=repeat_k_before_fill,
             payload_repeat=payload_repeat,
+            payload_seed=payload_seed,
         )
         wm_after = id_to_bin_image(
             id_input,
             repeat_k=repeat_k_after_fill,
             payload_repeat=payload_repeat,
+            payload_seed=payload_seed,
         )
 
     cv2.imwrite(before_path, (wm_before * 255).astype("uint8"))
@@ -382,9 +386,14 @@ if __name__ == "__main__":
 
     if auto_repeat_k and MODE in ("text", "id"):
         if MODE == "text":
-            wm_bin_raw = text_to_bin_image(text_input, repeat_k=1, encoding=text_encoding)
+            wm_bin_raw = text_to_bin_image(
+                text_input,
+                repeat_k=1,
+                encoding=text_encoding,
+                payload_seed=seed,
+            )
         else:
-            wm_bin_raw = id_to_bin_image(id_input, repeat_k=1)
+            wm_bin_raw = id_to_bin_image(id_input, repeat_k=1, payload_seed=seed)
 
         ber = estimate_bit_error_rate(
             host_paths=calib_paths[: min(3, len(calib_paths))],
@@ -449,6 +458,7 @@ if __name__ == "__main__":
             payload_repeat,
             repeat_k_before_fill,
             repeat_k,
+            seed,
         )
 
     if auto_optimize_alpha_global:

@@ -729,10 +729,16 @@ def optimize_alpha_bayesian(host_paths, wm_raw_path, MODE, text_input, id_input,
             repeat_k=repeat_k,
             payload_repeat=payload_repeat,
             encoding=text_encoding,
+            payload_seed=seed,
         )
         wm_raw = wm_bin_raw * 255
     elif MODE == "id":
-        wm_bin_raw = id_to_bin_image(id_input, repeat_k=repeat_k, payload_repeat=payload_repeat)
+        wm_bin_raw = id_to_bin_image(
+            id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            payload_seed=seed,
+        )
         wm_raw = wm_bin_raw * 255
     else:
         wm_raw = cv2.imread(wm_raw_path, cv2.IMREAD_GRAYSCALE)
@@ -764,12 +770,72 @@ def optimize_alpha_bayesian(host_paths, wm_raw_path, MODE, text_input, id_input,
     weight_psnr_norm = weight_psnr / weight_sum
     weight_nc_norm = weight_nc / weight_sum
 
+    def compute_char_acc_jpeg70(alpha_val, trial_seed):
+        char_acc_vals = []
+        psnr_no_attack_vals = []
+        for host_path in host_paths:
+            host = cv2.imread(host_path)
+            if host is None:
+                continue
+
+            wat, _, pos, safe_des_orig, safe_kp_orig = embed_watermark(host, wm, alpha_val, N, seed)
+            if len(pos) == 0:
+                continue
+
+            psnr_no_attack_vals.append(float(cv2.PSNR(host, wat)))
+
+            np.random.seed(trial_seed)
+            att_img = attack_jpeg(wat, 70)
+            ext_padded = extract_watermark(
+                att_img,
+                safe_des_orig,
+                safe_kp_orig,
+                alpha_val,
+                pos,
+                wm.shape,
+                seed=seed,
+                use_affine_correction=use_affine_correction,
+            )
+            ext = ext_padded[:orig_h, :orig_w]
+
+            if MODE == "text":
+                extracted_text = bin_image_to_text(
+                    ext,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                    encoding=text_encoding,
+                    payload_seed=seed,
+                )
+                char_acc = char_accuracy(text_input, extracted_text)
+            else:
+                extracted_id = bin_image_to_id(
+                    ext,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                    payload_seed=seed,
+                )
+                char_acc = char_accuracy(id_input, extracted_id)
+
+            char_acc_vals.append(float(char_acc))
+
+        if len(char_acc_vals) == 0:
+            return 0.0, 0.0
+        return float(np.mean(char_acc_vals)), float(np.mean(psnr_no_attack_vals))
+
     def objective(trial):
         alpha_val = trial.suggest_float("alpha", alpha_min, alpha_max)
 
         # Fix per-trial randomness so BO compares alpha values fairly.
         trial_seed = int(random_seed + trial.number * 1009)
         np.random.seed(trial_seed)
+
+        if MODE in ("text", "id"):
+            avg_char_acc, avg_psnr_no_attack = compute_char_acc_jpeg70(alpha_val, trial_seed)
+            trial.set_user_attr("avg_char_acc", avg_char_acc)
+            trial.set_user_attr("avg_psnr_no_attack", avg_psnr_no_attack)
+            if avg_psnr_no_attack < 40.0:
+                return 0.0
+            return avg_char_acc
 
         psnr_vals, ssim_vals, nc_vals, ber_vals = [], [], [], []
         valid_runs = 0
@@ -842,6 +908,27 @@ def optimize_alpha_bayesian(host_paths, wm_raw_path, MODE, text_input, id_input,
     sampler = optuna.samplers.TPESampler(seed=random_seed)
     study = optuna.create_study(direction="maximize", sampler=sampler)
     study.optimize(objective, n_trials=n_trials)
+
+    if MODE in ("text", "id"):
+        perfect_trials = [
+            t for t in study.trials
+            if t.user_attrs.get("avg_char_acc", 0.0) >= 1.0 - 1e-6
+            and t.user_attrs.get("avg_psnr_no_attack", 0.0) >= 40.0
+        ]
+        if perfect_trials:
+            best_alpha = float(min(t.params["alpha"] for t in perfect_trials))
+            best_score = 1.0
+            print(
+                f"[*] BO done | best_alpha={best_alpha:.3f} | CharAcc=1.0000 | JPEG_Q70"
+            )
+        else:
+            best_alpha = float(alpha_max)
+            best_score, best_psnr_no_attack = compute_char_acc_jpeg70(best_alpha, int(random_seed))
+            print(
+                f"[*] BO done | best_alpha={best_alpha:.3f} | CharAcc={best_score:.4f} | "
+                f"PSNR_no_attack={best_psnr_no_attack:.2f} | JPEG_Q70"
+            )
+        return best_alpha, best_score, study
 
     best_alpha = float(study.best_params["alpha"])
     best_score = float(study.best_value)
@@ -971,15 +1058,35 @@ def bit_string_to_bytes(bit_str):
         data.append(int(chunk, 2))
     return bytes(data)
 
-def text_to_payload_bits(text, encoding="utf-8"):
+def shuffle_bits(bit_str, seed):
+    if seed is None or len(bit_str) <= 1:
+        return bit_str
+    rng = np.random.RandomState(int(seed))
+    perm = rng.permutation(len(bit_str))
+    return ''.join(bit_str[i] for i in perm)
+
+
+def unshuffle_bits(bit_str, seed):
+    if seed is None or len(bit_str) <= 1:
+        return bit_str
+    rng = np.random.RandomState(int(seed))
+    perm = rng.permutation(len(bit_str))
+    inv = np.empty_like(perm)
+    inv[perm] = np.arange(len(perm))
+    return ''.join(bit_str[i] for i in inv)
+
+
+def text_to_payload_bits(text, encoding="utf-8", payload_seed=None):
     payload = text.encode(encoding)
     payload_len = len(payload)
     if payload_len > 65535:
         raise ValueError("Text payload too long for 16-bit length header.")
     header = format(payload_len, '016b')
-    return header + bytes_to_bit_string(payload)
+    payload_bits = bytes_to_bit_string(payload)
+    payload_bits = shuffle_bits(payload_bits, payload_seed)
+    return header + payload_bits
 
-def id_to_payload_bits(id_text):
+def id_to_payload_bits(id_text, payload_seed=None):
     if id_text is None:
         raise ValueError("ID input is required for mode=id.")
     if len(id_text) == 0:
@@ -988,9 +1095,10 @@ def id_to_payload_bits(id_text):
         raise ValueError("ID input must contain digits only (0-9).")
     digits = [int(ch) for ch in id_text]
     bits = ''.join(format(d, '04b') for d in digits)
+    bits = shuffle_bits(bits, payload_seed)
     return bits + '1111'
 
-def payload_bits_from_bin_image_text(bin_img, repeat_k=3, payload_repeat=1):
+def payload_bits_from_bin_image_text(bin_img, repeat_k=3, payload_repeat=1, payload_seed=None):
     bits = bin_img.flatten()
     decoded_bits = decode_repeated_bits(bits, repeat_k)
     bit_str = ''.join(map(str, decoded_bits))
@@ -1002,9 +1110,15 @@ def payload_bits_from_bin_image_text(bin_img, repeat_k=3, payload_repeat=1):
     copy_len = 16 + payload_len * 8
     if payload_repeat > 1 and copy_len > 0:
         bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
-    return bit_str[:copy_len]
+    if copy_len <= 16:
+        return bit_str[:copy_len]
 
-def payload_bits_from_bin_image_id(bin_img, repeat_k=1, payload_repeat=1):
+    header_bits = bit_str[:16]
+    payload_bits = bit_str[16:copy_len]
+    payload_bits = unshuffle_bits(payload_bits, payload_seed)
+    return header_bits + payload_bits
+
+def payload_bits_from_bin_image_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None):
     bits = bin_img.flatten()
     decoded_bits = decode_repeated_bits(bits, repeat_k)
     bit_str = ''.join(map(str, decoded_bits))
@@ -1014,7 +1128,13 @@ def payload_bits_from_bin_image_id(bin_img, repeat_k=1, payload_repeat=1):
     _, copy_len = decode_id_bits(bit_str)
     if payload_repeat > 1 and copy_len > 0:
         bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
-    return bit_str[:copy_len]
+    if copy_len <= 4:
+        return bit_str[:copy_len]
+
+    payload_bits = bit_str[:copy_len - 4]
+    terminator = bit_str[copy_len - 4:copy_len]
+    payload_bits = unshuffle_bits(payload_bits, payload_seed)
+    return payload_bits + terminator
 
 def payload_ber(orig_bits, extracted_bits):
     if orig_bits is None:
@@ -1029,7 +1149,7 @@ def payload_ber(orig_bits, extracted_bits):
     missing = n - compare_len
     return float(errors + missing) / float(n)
 
-def text_to_bin_image(text, repeat_k=3, payload_repeat=1, encoding="utf-8"):
+def text_to_bin_image(text, repeat_k=3, payload_repeat=1, encoding="utf-8", payload_seed=None):
     """Convert text to bits (UTF-8 by default) and repeat each bit for robustness."""
     payload = text.encode(encoding)
     payload_len = len(payload)
@@ -1037,7 +1157,9 @@ def text_to_bin_image(text, repeat_k=3, payload_repeat=1, encoding="utf-8"):
         raise ValueError("Text payload too long for 16-bit length header.")
 
     header = format(payload_len, '016b')
-    bits = header + bytes_to_bit_string(payload)
+    payload_bits = bytes_to_bit_string(payload)
+    payload_bits = shuffle_bits(payload_bits, payload_seed)
+    bits = header + payload_bits
     if payload_repeat < 1:
         raise ValueError("payload_repeat must be >= 1.")
     if payload_repeat > 1:
@@ -1055,7 +1177,7 @@ def text_to_bin_image(text, repeat_k=3, payload_repeat=1, encoding="utf-8"):
     )
     return bits_to_square_matrix(bit_array)
 
-def bin_image_to_text(bin_img, repeat_k=3, payload_repeat=1, encoding="utf-8"):
+def bin_image_to_text(bin_img, repeat_k=3, payload_repeat=1, encoding="utf-8", payload_seed=None):
     """Decode bits using majority voting over repeated groups."""
     bits = bin_img.flatten()
     decoded_bits = decode_repeated_bits(bits, repeat_k)
@@ -1080,10 +1202,11 @@ def bin_image_to_text(bin_img, repeat_k=3, payload_repeat=1, encoding="utf-8"):
     header_bits = bit_str[:16]
     payload_len = int(header_bits, 2)
     payload_bits = bit_str[16:16 + payload_len * 8]
+    payload_bits = unshuffle_bits(payload_bits, payload_seed)
     payload = bit_string_to_bytes(payload_bits)
     return payload.decode(encoding, errors="replace")
 
-def id_to_bin_image(id_text, repeat_k=1, payload_repeat=1):
+def id_to_bin_image(id_text, repeat_k=1, payload_repeat=1, payload_seed=None):
     """Convert numeric ID to 4-bit digits, optionally with repetition."""
     if id_text is None:
         raise ValueError("ID input is required for mode=id.")
@@ -1096,6 +1219,7 @@ def id_to_bin_image(id_text, repeat_k=1, payload_repeat=1):
     bits = ''.join(format(d, '04b') for d in digits)
 
     # Terminator nibble (0xF) so decoder knows where to stop.
+    bits = shuffle_bits(bits, payload_seed)
     bits += '1111'
 
     if payload_repeat < 1:
@@ -1111,7 +1235,7 @@ def id_to_bin_image(id_text, repeat_k=1, payload_repeat=1):
     )
     return bits_to_square_matrix(bit_array)
 
-def bin_image_to_id(bin_img, repeat_k=1, payload_repeat=1):
+def bin_image_to_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None):
     """Decode 4-bit digits until terminator nibble (0xF)."""
     bits = bin_img.flatten()
     decoded_bits = decode_repeated_bits(bits, repeat_k)
@@ -1123,7 +1247,14 @@ def bin_image_to_id(bin_img, repeat_k=1, payload_repeat=1):
     decoded_id, copy_len = decode_id_bits(bit_str)
     if payload_repeat > 1 and copy_len > 0:
         bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
-        decoded_id, _ = decode_id_bits(bit_str)
+        decoded_id, copy_len = decode_id_bits(bit_str)
+
+    if payload_seed is not None and copy_len > 4:
+        payload_bits = bit_str[:copy_len - 4]
+        terminator = bit_str[copy_len - 4:copy_len]
+        payload_bits = unshuffle_bits(payload_bits, payload_seed)
+        decoded_id, _ = decode_id_bits(payload_bits + terminator)
+
     return decoded_id
 
 def decode_id_bits(bit_str):
@@ -1169,6 +1300,10 @@ def sanitize_excel_text(value):
     return ''.join(ch for ch in text if ch >= ' ' or ch in '\t\n\r')
 
 def evaluate(orig, wat, wm, ext_wm):
+    if orig is None or wat is None:
+        return 0.0, 0.0, 0.0, 1.0
+    if orig.shape[:2] != wat.shape[:2]:
+        orig = cv2.resize(orig, (wat.shape[1], wat.shape[0]), interpolation=cv2.INTER_AREA)
     psnr = cv2.PSNR(orig, wat)
     ssim_val = ssim_func(orig, wat, channel_axis=2)
 
@@ -1325,11 +1460,17 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
             repeat_k=repeat_k,
             payload_repeat=payload_repeat,
             encoding=text_encoding,
+            payload_seed=seed,
         )
         wm_raw = wm_bin_raw * 255
     elif MODE == "id":
         # Convert numeric ID into a binary watermark image
-        wm_bin_raw = id_to_bin_image(id_input, repeat_k=repeat_k, payload_repeat=payload_repeat)
+        wm_bin_raw = id_to_bin_image(
+            id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            payload_seed=seed,
+        )
         wm_raw = wm_bin_raw * 255
     else:
         wm_raw = cv2.imread(wm_raw_path, cv2.IMREAD_GRAYSCALE)
@@ -1424,15 +1565,17 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                     repeat_k=repeat_k,
                     payload_repeat=payload_repeat,
                     encoding=text_encoding,
+                    payload_seed=seed,
                 )
                 extracted_text_clean = sanitize_excel_text(extracted_text)
                 # Character-level accuracy vs input
                 char_acc = char_accuracy(text_input, extracted_text_clean)
-                orig_bits = text_to_payload_bits(text_input, encoding=text_encoding)
+                orig_bits = text_to_payload_bits(text_input, encoding=text_encoding, payload_seed=seed)
                 extracted_bits = payload_bits_from_bin_image_text(
                     ext,
                     repeat_k=repeat_k,
                     payload_repeat=payload_repeat,
+                    payload_seed=seed,
                 )
                 bit_ber = payload_ber(orig_bits, extracted_bits)
                 row["ExtractedText"] = extracted_text_clean
@@ -1443,14 +1586,20 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                     f"Extracted text: {extracted_text_clean} | CharAcc: {char_acc:.4f} | PayloadBER: {bit_ber:.4f}"
                 )
             elif MODE == "id":
-                extracted_id = bin_image_to_id(ext, repeat_k=repeat_k, payload_repeat=payload_repeat)
+                extracted_id = bin_image_to_id(
+                    ext,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                    payload_seed=seed,
+                )
                 extracted_id_clean = sanitize_excel_text(extracted_id)
                 char_acc = char_accuracy(id_input, extracted_id_clean)
-                orig_bits = id_to_payload_bits(id_input)
+                orig_bits = id_to_payload_bits(id_input, payload_seed=seed)
                 extracted_bits = payload_bits_from_bin_image_id(
                     ext,
                     repeat_k=repeat_k,
                     payload_repeat=payload_repeat,
+                    payload_seed=seed,
                 )
                 bit_ber = payload_ber(orig_bits, extracted_bits)
                 row["ExtractedID"] = extracted_id_clean
@@ -1517,6 +1666,7 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
             repeat_k=key["repeat_k"],
             payload_repeat=key["payload_repeat"],
             encoding=key["text_encoding"],
+            payload_seed=key.get("seed"),
         )
         wm_orig_bin = wm_bin_raw
     elif key["mode"] == "id":
@@ -1526,6 +1676,7 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
             key.get("id_input", ""),
             repeat_k=key["repeat_k"],
             payload_repeat=key["payload_repeat"],
+            payload_seed=key.get("seed"),
         )
         wm_orig_bin = wm_bin_raw
     else:
@@ -1542,7 +1693,7 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
     print("-" * 55)
 
     results_list = []
-    attacks = get_attack_scenarios()
+    attacks = [("No_Attack", lambda x: x)]
     for name, func in attacks:
         att_img = func(host)
         cv2.imwrite(os.path.join(attack_dir, f"attack_{name}.png"), att_img)
@@ -1578,14 +1729,20 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
                 repeat_k=key["repeat_k"],
                 payload_repeat=key["payload_repeat"],
                 encoding=key["text_encoding"],
+                payload_seed=key.get("seed"),
             )
             extracted_text_clean = sanitize_excel_text(extracted_text)
             char_acc = char_accuracy(key.get("text_input", ""), extracted_text_clean)
-            orig_bits = text_to_payload_bits(key.get("text_input", ""), encoding=key["text_encoding"])
+            orig_bits = text_to_payload_bits(
+                key.get("text_input", ""),
+                encoding=key["text_encoding"],
+                payload_seed=key.get("seed"),
+            )
             extracted_bits = payload_bits_from_bin_image_text(
                 ext,
                 repeat_k=key["repeat_k"],
                 payload_repeat=key["payload_repeat"],
+                payload_seed=key.get("seed"),
             )
             bit_ber = payload_ber(orig_bits, extracted_bits)
             row["ExtractedText"] = extracted_text_clean
@@ -1600,14 +1757,16 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
                 ext,
                 repeat_k=key["repeat_k"],
                 payload_repeat=key["payload_repeat"],
+                payload_seed=key.get("seed"),
             )
             extracted_id_clean = sanitize_excel_text(extracted_id)
             char_acc = char_accuracy(key.get("id_input", ""), extracted_id_clean)
-            orig_bits = id_to_payload_bits(key.get("id_input", ""))
+            orig_bits = id_to_payload_bits(key.get("id_input", ""), payload_seed=key.get("seed"))
             extracted_bits = payload_bits_from_bin_image_id(
                 ext,
                 repeat_k=key["repeat_k"],
                 payload_repeat=key["payload_repeat"],
+                payload_seed=key.get("seed"),
             )
             bit_ber = payload_ber(orig_bits, extracted_bits)
             row["ExtractedID"] = extracted_id_clean

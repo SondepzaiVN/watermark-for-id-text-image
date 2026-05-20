@@ -22,7 +22,7 @@ from models.watermark_pipeline import (
 )
 
 
-def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payload_repeat, repeat_k_before_fill, repeat_k_after_fill):
+def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payload_repeat, repeat_k_before_fill, repeat_k_after_fill, payload_seed):
     if mode not in ("text", "id"):
         return
 
@@ -36,23 +36,27 @@ def save_fill_k_preview_images(mode, text_input, id_input, text_encoding, payloa
             repeat_k=repeat_k_before_fill,
             payload_repeat=payload_repeat,
             encoding=text_encoding,
+            payload_seed=payload_seed,
         )
         wm_after = text_to_bin_image(
             text_input,
             repeat_k=repeat_k_after_fill,
             payload_repeat=payload_repeat,
             encoding=text_encoding,
+            payload_seed=payload_seed,
         )
     else:
         wm_before = id_to_bin_image(
             id_input,
             repeat_k=repeat_k_before_fill,
             payload_repeat=payload_repeat,
+            payload_seed=payload_seed,
         )
         wm_after = id_to_bin_image(
             id_input,
             repeat_k=repeat_k_after_fill,
             payload_repeat=payload_repeat,
+            payload_seed=payload_seed,
         )
 
     cv2.imwrite(before_path, (wm_before * 255).astype("uint8"))
@@ -124,7 +128,7 @@ def build_parser():
         help="Target bit success probability for auto repeat-k.",
     )
     parser.add_argument("--alpha", type=int, default=100, help="Base embedding strength.")
-    parser.add_argument("--n", type=int, default=12, help="Number of selected ROIs.")
+    parser.add_argument("--n", type=int, default=10, help="Number of selected ROIs.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--auto-optimize-alpha-global",
@@ -213,6 +217,90 @@ def prompt_if_missing_args(mode, text_input, id_input, img_dir, img_path, text_e
     return selected_mode, text_input, id_input, img_dir, img_path, text_encoding
 
 
+def resize_image_keep_ratio(image, target_min=None, target_max=None):
+    height, width = image.shape[:2]
+    min_side = min(height, width)
+    max_side = max(height, width)
+
+    if target_min is not None and min_side < target_min:
+        scale = target_min / float(min_side)
+    elif target_max is not None and max_side > target_max:
+        scale = target_max / float(max_side)
+    else:
+        return image
+
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    return cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_AREA)
+
+
+def prompt_resize_for_host_image(image_path):
+    image = cv2.imread(image_path)
+    if image is None:
+        print(f"[!] Failed to read image: {image_path}")
+        return image_path
+
+    height, width = image.shape[:2]
+    min_side = min(height, width)
+    max_side = max(height, width)
+
+    target_min = None
+    target_max = None
+
+    if max_side > 2048:
+        print(f"[*] Anh host {os.path.basename(image_path)} co canh lon hon 2048px.")
+        print("Chon cach resize (giu ti le):")
+        print("  1) Canh lon nhat = 2048px (phu hop Facebook)")
+        print("  2) Canh lon nhat = 1080px (phu hop Instagram/Thread)")
+        print("  3) Canh lon nhat = 1024px (phu hop Zalo)")
+        print("  4) Khong resize")
+        choice = input("Nhap lua chon [1-4] (default=4): ").strip() or "4"
+        if choice == "1":
+            target_max = 2048
+        elif choice == "2":
+            target_max = 1080
+        elif choice == "3":
+            target_max = 1024
+    elif max_side > 1024:
+        print(f"[*] Anh host {os.path.basename(image_path)} co canh lon hon 1024px.")
+        print("Chon cach resize (giu ti le):")
+        print("  1) Canh lon nhat = 1024px (phu hop Zalo)")
+        print("  2) Khong resize")
+        choice = input("Nhap lua chon [1-2] (default=2): ").strip() or "2"
+        if choice == "1":
+            target_max = 1024
+    elif max_side > 1080:
+        print(f"[*] Anh host {os.path.basename(image_path)} co canh lon hon 1080px.")
+        print("Chon cach resize (giu ti le):")
+        print("  1) Canh lon nhat = 1080px (phu hop Instagram/Thread)")
+        print("  2) Khong resize")
+        choice = input("Nhap lua chon [1-2] (default=2): ").strip() or "2"
+        if choice == "1":
+            target_max = 1080
+    elif min_side < 320:
+        print(f"[*] Anh host {os.path.basename(image_path)} co canh nho hon 320px.")
+        print("Chon cach resize (giu ti le):")
+        print("  1) Canh nho nhat = 320px")
+        print("  2) Khong resize")
+        choice = input("Nhap lua chon [1-2] (default=2): ").strip() or "2"
+        if choice == "1":
+            target_min = 320
+
+    if target_min is None and target_max is None:
+        return image_path
+
+    resized = resize_image_keep_ratio(image, target_min=target_min, target_max=target_max)
+    if resized is image:
+        return image_path
+
+    os.makedirs("results/resize", exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(image_path))[0]
+    resized_path = os.path.join("results/resize", f"{base_name}_resized.jpg")
+    cv2.imwrite(resized_path, resized)
+    print(f"[*] Saved resized image: {resized_path}")
+    return resized_path
+
+
 if __name__ == "__main__":
     parser = build_parser()
     args = parser.parse_args()
@@ -296,14 +384,24 @@ if __name__ == "__main__":
             )
         raise SystemExit(0)
 
+    processed_paths = []
+    for img_path in all_img_paths:
+        processed_paths.append(prompt_resize_for_host_image(img_path))
+    all_img_paths = processed_paths
+
     global_alpha = alpha
     calib_paths = all_img_paths[: min(5, len(all_img_paths))]
 
     if auto_repeat_k and MODE in ("text", "id"):
         if MODE == "text":
-            wm_bin_raw = text_to_bin_image(text_input, repeat_k=1, encoding=text_encoding)
+            wm_bin_raw = text_to_bin_image(
+                text_input,
+                repeat_k=1,
+                encoding=text_encoding,
+                payload_seed=seed,
+            )
         else:
-            wm_bin_raw = id_to_bin_image(id_input, repeat_k=1)
+            wm_bin_raw = id_to_bin_image(id_input, repeat_k=1, payload_seed=seed)
 
         ber = estimate_bit_error_rate(
             host_paths=calib_paths[: min(3, len(calib_paths))],
@@ -355,6 +453,7 @@ if __name__ == "__main__":
             payload_repeat,
             repeat_k_before_fill,
             repeat_k,
+            seed,
         )
 
     if auto_optimize_alpha_global:
