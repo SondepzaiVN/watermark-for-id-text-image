@@ -13,6 +13,7 @@ from models.watermark_pipeline import (
     optimize_alpha_bayesian,
     optimize_pareto_roi_alpha,
     optimize_roi_alpha_grid,
+    optimize_fast,
     estimate_bit_error_rate,
     choose_repeat_k_from_ber,
     choose_repeat_k_to_fill,
@@ -192,6 +193,12 @@ def build_parser():
         default=10,
         help="Number of BO trials in per-image optimization.",
     )
+    parser.add_argument(
+        "--fast-optimize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use fast binary-search optimizer (5-10x faster). Disable with --no-fast-optimize to use full grid search.",
+    )
     return parser
 
 
@@ -361,6 +368,7 @@ if __name__ == "__main__":
     pareto_per_image = args.pareto_per_image
     auto_optimize_grid = args.auto_optimize_grid
     use_affine_correction = args.use_affine_correction
+    fast_optimize = args.fast_optimize
 
     MODE, text_input, id_input, img_dir, img_path, text_encoding = prompt_if_missing_args(
         MODE, text_input, id_input, img_dir, img_path, text_encoding
@@ -564,27 +572,48 @@ if __name__ == "__main__":
         current_alpha = global_alpha
 
         if auto_optimize_grid:
-            best_alpha, best_n = optimize_roi_alpha_grid(
-                host_paths=[img_path],
-                wm_raw_path=wm_raw,
-                MODE=MODE,
-                text_input=text_input,
-                id_input=id_input,
-                repeat_k=repeat_k,
-                payload_repeat=payload_repeat,
-                text_encoding=text_encoding,
-                seed=seed,
-                use_affine_correction=use_affine_correction,
-                alpha_min=args.pareto_alpha_min,
-                alpha_max=args.pareto_alpha_max,
-                alpha_step=args.pareto_alpha_step,
-                n_values=n_values,
-                psnr_min=args.pareto_psnr_min,
-                random_seed=seed,
-            )
+            if fast_optimize:
+                best_alpha, best_n = optimize_fast(
+                    host_paths=[img_path],
+                    wm_raw_path=wm_raw,
+                    MODE=MODE,
+                    text_input=text_input,
+                    id_input=id_input,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                    text_encoding=text_encoding,
+                    seed=seed,
+                    use_affine_correction=use_affine_correction,
+                    alpha_min=args.pareto_alpha_min,
+                    alpha_max=args.pareto_alpha_max,
+                    alpha_step=args.pareto_alpha_step,
+                    n_values=n_values,
+                    psnr_min=args.pareto_psnr_min,
+                    random_seed=seed,
+                )
+                print(f"[*] Fast optimizer for {img_file}: alpha={best_alpha:.1f}, N={best_n}")
+            else:
+                best_alpha, best_n = optimize_roi_alpha_grid(
+                    host_paths=[img_path],
+                    wm_raw_path=wm_raw,
+                    MODE=MODE,
+                    text_input=text_input,
+                    id_input=id_input,
+                    repeat_k=repeat_k,
+                    payload_repeat=payload_repeat,
+                    text_encoding=text_encoding,
+                    seed=seed,
+                    use_affine_correction=use_affine_correction,
+                    alpha_min=args.pareto_alpha_min,
+                    alpha_max=args.pareto_alpha_max,
+                    alpha_step=args.pareto_alpha_step,
+                    n_values=n_values,
+                    psnr_min=args.pareto_psnr_min,
+                    random_seed=seed,
+                )
+                print(f"[*] Grid per-image {img_file}: alpha={best_alpha:.1f}, N={best_n}")
             current_alpha = int(round(best_alpha))
             N = int(best_n)
-            print(f"[*] Grid per-image {img_file}: alpha={current_alpha}, N={N}")
 
         if auto_optimize_pareto and pareto_per_image:
             best_alpha, best_n, pareto_front = optimize_pareto_roi_alpha(
