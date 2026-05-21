@@ -437,34 +437,6 @@ if __name__ == "__main__":
                 except ValueError:
                     pass
 
-    if auto_optimize_pareto and not pareto_per_image:
-        best_alpha, best_n, pareto_front = optimize_pareto_roi_alpha(
-            host_paths=calib_paths,
-            wm_raw_path=wm_raw,
-            MODE=MODE,
-            text_input=text_input,
-            id_input=id_input,
-            repeat_k=repeat_k,
-            payload_repeat=payload_repeat,
-            text_encoding=text_encoding,
-            seed=seed,
-            use_affine_correction=use_affine_correction,
-            alpha_min=args.pareto_alpha_min,
-            alpha_max=args.pareto_alpha_max,
-            alpha_step=args.pareto_alpha_step,
-            n_min=args.pareto_n_min,
-            n_max=args.pareto_n_max,
-            n_step=args.pareto_n_step,
-            n_values=n_values,
-            psnr_min=args.pareto_psnr_min,
-            random_seed=seed,
-        )
-        global_alpha = int(round(best_alpha))
-        N = int(best_n)
-        print(
-            f"[*] Pareto selected alpha={global_alpha}, N={N} | front_size={len(pareto_front)}"
-        )
-
     if auto_repeat_k and MODE in ("text", "id"):
         if MODE == "text":
             wm_bin_raw = text_to_bin_image(
@@ -527,6 +499,37 @@ if __name__ == "__main__":
             repeat_k_before_fill,
             repeat_k,
             seed,
+        )
+        print(
+            f"[*] Payload settings -> seed={seed} | repeat_k={repeat_k} | payload_repeat={payload_repeat}"
+        )
+
+    if auto_optimize_pareto and not pareto_per_image:
+        best_alpha, best_n, pareto_front = optimize_pareto_roi_alpha(
+            host_paths=calib_paths,
+            wm_raw_path=wm_raw,
+            MODE=MODE,
+            text_input=text_input,
+            id_input=id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            text_encoding=text_encoding,
+            seed=seed,
+            use_affine_correction=use_affine_correction,
+            alpha_min=args.pareto_alpha_min,
+            alpha_max=args.pareto_alpha_max,
+            alpha_step=args.pareto_alpha_step,
+            n_min=args.pareto_n_min,
+            n_max=args.pareto_n_max,
+            n_step=args.pareto_n_step,
+            n_values=n_values,
+            psnr_min=args.pareto_psnr_min,
+            random_seed=seed,
+        )
+        global_alpha = int(round(best_alpha))
+        N = int(best_n)
+        print(
+            f"[*] Pareto selected alpha={global_alpha}, N={N} | front_size={len(pareto_front)}"
         )
 
     if auto_optimize_alpha_global and not auto_optimize_pareto:

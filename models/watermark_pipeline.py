@@ -807,6 +807,7 @@ def optimize_alpha_bayesian(host_paths, wm_raw_path, MODE, text_input, id_input,
                     repeat_k=repeat_k,
                     payload_repeat=payload_repeat,
                     payload_seed=seed,
+                    expected_id_len=len(id_input),
                 )
                 char_acc = char_accuracy(id_input, extracted_id)
 
@@ -1139,6 +1140,7 @@ def optimize_pareto_roi_alpha(
                                 repeat_k=repeat_k,
                                 payload_repeat=payload_repeat,
                                 payload_seed=seed,
+                                expected_id_len=len(id_input),
                             )
                             char_acc = char_accuracy(id_input, extracted_id)
                             orig_bits = id_to_payload_bits_unshuffled(id_input)
@@ -1147,6 +1149,7 @@ def optimize_pareto_roi_alpha(
                                 repeat_k=repeat_k,
                                 payload_repeat=payload_repeat,
                                 payload_seed=seed,
+                                expected_id_len=len(id_input),
                             )
                             payload_ber_val = payload_ber(orig_bits, extracted_bits)
                         char_acc_vals.append(float(char_acc))
@@ -1298,6 +1301,7 @@ def optimize_roi_alpha_grid(
         for n_idx, n_val in enumerate(n_vals):
             np.random.seed(int(random_seed))
             psnr_no_attack_vals = []
+            nc_no_attack_vals = []
             payload_ber_vals = []
             nc_vals, ber_vals = [], []
             valid_runs = 0
@@ -1314,6 +1318,20 @@ def optimize_roi_alpha_grid(
                     continue
 
                 psnr_no_attack_vals.append(float(cv2.PSNR(host, wat)))
+
+                ext_no_attack = extract_watermark(
+                    wat,
+                    safe_des_orig,
+                    safe_kp_orig,
+                    alpha_val,
+                    pos,
+                    wm.shape,
+                    seed=seed,
+                    use_affine_correction=use_affine_correction,
+                )
+                ext_no_attack = ext_no_attack[:orig_h, :orig_w]
+                _, _, nc_no_attack, _ = evaluate(host, wat, wm_orig_bin, ext_no_attack)
+                nc_no_attack_vals.append(float(nc_no_attack))
 
                 for attack_idx, (_, attack_fn) in enumerate(attacks):
                     np.random.seed(int(random_seed + host_idx * 100 + attack_idx))
@@ -1349,6 +1367,7 @@ def optimize_roi_alpha_grid(
                                 repeat_k=repeat_k,
                                 payload_repeat=payload_repeat,
                                 payload_seed=seed,
+                                expected_id_len=len(id_input),
                             )
                         payload_ber_vals.append(float(payload_ber(orig_bits, extracted_bits)))
                     else:
@@ -1362,6 +1381,9 @@ def optimize_roi_alpha_grid(
                 continue
 
             avg_psnr_no_attack = float(np.mean(psnr_no_attack_vals))
+            min_nc_no_attack = float(np.min(nc_no_attack_vals)) if nc_no_attack_vals else 0.0
+            if min_nc_no_attack < 0.9999:
+                continue
             if avg_psnr_no_attack < psnr_min:
                 if n_idx == 0:
                     stop_alpha = True
@@ -1611,14 +1633,22 @@ def payload_bits_from_bin_image_text(bin_img, repeat_k=3, payload_repeat=1, payl
     payload_bits = unshuffle_bits(payload_bits, payload_seed)
     return header_bits + payload_bits
 
-def payload_bits_from_bin_image_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None):
+def payload_bits_from_bin_image_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None, expected_id_len=None):
     bits = bin_img.flatten()
     decoded_bits = decode_repeated_bits(bits, repeat_k)
     bit_str = ''.join(map(str, decoded_bits))
     if payload_repeat < 1:
         return ""
 
-    _, copy_len = decode_id_bits(bit_str)
+    # If we know the expected ID length, compute copy_len directly.
+    # This avoids scanning shuffled bits with decode_id_bits, which stops early
+    # on nibbles > 9 produced by shuffle and yields a wrong copy_len.
+    if expected_id_len is not None and expected_id_len > 0:
+        copy_len = expected_id_len * 4 + 4  # 4 bits per digit + 4-bit terminator
+    else:
+        # Fallback (only correct when payload_seed is None / no shuffling)
+        _, copy_len = decode_id_bits(bit_str)
+
     if payload_repeat > 1 and copy_len > 0:
         bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
     if copy_len <= 4:
@@ -1728,8 +1758,18 @@ def id_to_bin_image(id_text, repeat_k=1, payload_repeat=1, payload_seed=None):
     )
     return bits_to_square_matrix(bit_array)
 
-def bin_image_to_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None):
-    """Decode 4-bit digits until terminator nibble (0xF)."""
+def bin_image_to_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None, expected_id_len=None):
+    """Decode 4-bit digits until terminator nibble (0xF).
+
+    Args:
+        expected_id_len: Number of digits in the original ID.  When provided
+            (and payload_seed is used), copy_len is computed as
+            ``expected_id_len * 4 + 4`` instead of being inferred by scanning
+            the still-shuffled bit string with decode_id_bits.  Scanning
+            shuffled bits is incorrect because shuffle can produce nibbles with
+            values 10-14 that stop the scan prematurely, yielding a wrong
+            copy_len and therefore a wrong unshuffle slice.
+    """
     bits = bin_img.flatten()
     decoded_bits = decode_repeated_bits(bits, repeat_k)
 
@@ -1737,16 +1777,26 @@ def bin_image_to_id(bin_img, repeat_k=1, payload_repeat=1, payload_seed=None):
     if payload_repeat < 1:
         return ""
 
-    decoded_id, copy_len = decode_id_bits(bit_str)
+    # Determine copy_len: prefer the exact length when we know it.
+    if expected_id_len is not None and expected_id_len > 0:
+        copy_len = expected_id_len * 4 + 4  # 4 bits per digit + 4-bit terminator
+    else:
+        # Fallback: scan for terminator (only reliable when payload_seed is None)
+        _, copy_len = decode_id_bits(bit_str)
+
     if payload_repeat > 1 and copy_len > 0:
         bit_str = vote_payload_copies(bit_str, copy_len, payload_repeat)
-        decoded_id, copy_len = decode_id_bits(bit_str)
+        if expected_id_len is None:
+            # Re-scan only when we don't have an exact length
+            _, copy_len = decode_id_bits(bit_str)
 
     if payload_seed is not None and copy_len > 4:
         payload_bits = bit_str[:copy_len - 4]
         terminator = bit_str[copy_len - 4:copy_len]
         payload_bits = unshuffle_bits(payload_bits, payload_seed)
         decoded_id, _ = decode_id_bits(payload_bits + terminator)
+    else:
+        decoded_id, _ = decode_id_bits(bit_str[:copy_len])
 
     return decoded_id
 
@@ -2084,6 +2134,7 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                     repeat_k=repeat_k,
                     payload_repeat=payload_repeat,
                     payload_seed=seed,
+                    expected_id_len=len(id_input),
                 )
                 extracted_id_clean = sanitize_excel_text(extracted_id)
                 char_acc = char_accuracy(id_input, extracted_id_clean)
@@ -2093,6 +2144,7 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                     repeat_k=repeat_k,
                     payload_repeat=payload_repeat,
                     payload_seed=seed,
+                    expected_id_len=len(id_input),
                 )
                 bit_ber = payload_ber(orig_bits, extracted_bits)
                 row["ExtractedID"] = extracted_id_clean
@@ -2245,20 +2297,23 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
                 f"Extracted text: {extracted_text_clean} | CharAcc: {char_acc:.4f} | PayloadBER: {bit_ber:.4f}"
             )
         elif key["mode"] == "id":
+            _id_input_key = key.get("id_input", "")
             extracted_id = bin_image_to_id(
                 ext,
                 repeat_k=key["repeat_k"],
                 payload_repeat=key["payload_repeat"],
                 payload_seed=key.get("seed"),
+                expected_id_len=len(_id_input_key),
             )
             extracted_id_clean = sanitize_excel_text(extracted_id)
-            char_acc = char_accuracy(key.get("id_input", ""), extracted_id_clean)
-            orig_bits = id_to_payload_bits_unshuffled(key.get("id_input", ""))
+            char_acc = char_accuracy(_id_input_key, extracted_id_clean)
+            orig_bits = id_to_payload_bits_unshuffled(_id_input_key)
             extracted_bits = payload_bits_from_bin_image_id(
                 ext,
                 repeat_k=key["repeat_k"],
                 payload_repeat=key["payload_repeat"],
                 payload_seed=key.get("seed"),
+                expected_id_len=len(_id_input_key),
             )
             bit_ber = payload_ber(orig_bits, extracted_bits)
             row["ExtractedID"] = extracted_id_clean
