@@ -11,6 +11,8 @@ from models.watermark_pipeline import (
     main,
     extract_only,
     optimize_alpha_bayesian,
+    optimize_pareto_roi_alpha,
+    optimize_roi_alpha_grid,
     estimate_bit_error_rate,
     choose_repeat_k_from_ber,
     choose_repeat_k_to_fill,
@@ -142,6 +144,36 @@ def build_parser():
         default=True,
         help="Enable/disable per-image Bayesian optimization for alpha.",
     )
+    parser.add_argument(
+        "--auto-optimize-pareto",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable Pareto optimization over ROI count and alpha.",
+    )
+    parser.add_argument(
+        "--pareto-per-image",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable/disable per-image Pareto optimization.",
+    )
+    parser.add_argument(
+        "--auto-optimize-grid",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable/disable per-image grid search for ROI count and alpha.",
+    )
+    parser.add_argument("--pareto-alpha-min", type=float, default=80.0, help="Pareto alpha min.")
+    parser.add_argument("--pareto-alpha-max", type=float, default=120.0, help="Pareto alpha max.")
+    parser.add_argument("--pareto-alpha-step", type=float, default=5.0, help="Pareto alpha step.")
+    parser.add_argument("--pareto-n-min", type=int, default=6, help="Pareto N min.")
+    parser.add_argument("--pareto-n-max", type=int, default=14, help="Pareto N max.")
+    parser.add_argument("--pareto-n-step", type=int, default=2, help="Pareto N step.")
+    parser.add_argument(
+        "--pareto-n-values",
+        default="1,2,4,8,12,16,24",
+        help="Comma-separated ROI counts for Pareto search (overrides min/max/step).",
+    )
+    parser.add_argument("--pareto-psnr-min", type=float, default=40.0, help="Pareto PSNR min.")
     parser.add_argument(
         "--use-affine-correction",
         action=argparse.BooleanOptionalAction,
@@ -325,6 +357,9 @@ if __name__ == "__main__":
     seed = args.seed
     auto_optimize_alpha_global = args.auto_optimize_alpha_global
     auto_optimize_alpha_per_image = args.auto_optimize_alpha_per_image
+    auto_optimize_pareto = args.auto_optimize_pareto
+    pareto_per_image = args.pareto_per_image
+    auto_optimize_grid = args.auto_optimize_grid
     use_affine_correction = args.use_affine_correction
 
     MODE, text_input, id_input, img_dir, img_path, text_encoding = prompt_if_missing_args(
@@ -392,6 +427,44 @@ if __name__ == "__main__":
     global_alpha = alpha
     calib_paths = all_img_paths[: min(5, len(all_img_paths))]
 
+    n_values = []
+    if args.pareto_n_values:
+        for token in args.pareto_n_values.split(","):
+            token = token.strip()
+            if token:
+                try:
+                    n_values.append(int(token))
+                except ValueError:
+                    pass
+
+    if auto_optimize_pareto and not pareto_per_image:
+        best_alpha, best_n, pareto_front = optimize_pareto_roi_alpha(
+            host_paths=calib_paths,
+            wm_raw_path=wm_raw,
+            MODE=MODE,
+            text_input=text_input,
+            id_input=id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            text_encoding=text_encoding,
+            seed=seed,
+            use_affine_correction=use_affine_correction,
+            alpha_min=args.pareto_alpha_min,
+            alpha_max=args.pareto_alpha_max,
+            alpha_step=args.pareto_alpha_step,
+            n_min=args.pareto_n_min,
+            n_max=args.pareto_n_max,
+            n_step=args.pareto_n_step,
+            n_values=n_values,
+            psnr_min=args.pareto_psnr_min,
+            random_seed=seed,
+        )
+        global_alpha = int(round(best_alpha))
+        N = int(best_n)
+        print(
+            f"[*] Pareto selected alpha={global_alpha}, N={N} | front_size={len(pareto_front)}"
+        )
+
     if auto_repeat_k and MODE in ("text", "id"):
         if MODE == "text":
             wm_bin_raw = text_to_bin_image(
@@ -456,7 +529,7 @@ if __name__ == "__main__":
             seed,
         )
 
-    if auto_optimize_alpha_global:
+    if auto_optimize_alpha_global and not auto_optimize_pareto:
         best_alpha, best_score, _ = optimize_alpha_bayesian(
             host_paths=calib_paths,
             wm_raw_path=wm_raw,
@@ -487,7 +560,58 @@ if __name__ == "__main__":
         img_file = os.path.basename(img_path)
         current_alpha = global_alpha
 
-        if auto_optimize_alpha_per_image:
+        if auto_optimize_grid:
+            best_alpha, best_n = optimize_roi_alpha_grid(
+                host_paths=[img_path],
+                wm_raw_path=wm_raw,
+                MODE=MODE,
+                text_input=text_input,
+                id_input=id_input,
+                repeat_k=repeat_k,
+                payload_repeat=payload_repeat,
+                text_encoding=text_encoding,
+                seed=seed,
+                use_affine_correction=use_affine_correction,
+                alpha_min=args.pareto_alpha_min,
+                alpha_max=args.pareto_alpha_max,
+                alpha_step=args.pareto_alpha_step,
+                n_values=n_values,
+                psnr_min=args.pareto_psnr_min,
+                random_seed=seed,
+            )
+            current_alpha = int(round(best_alpha))
+            N = int(best_n)
+            print(f"[*] Grid per-image {img_file}: alpha={current_alpha}, N={N}")
+
+        if auto_optimize_pareto and pareto_per_image:
+            best_alpha, best_n, pareto_front = optimize_pareto_roi_alpha(
+                host_paths=[img_path],
+                wm_raw_path=wm_raw,
+                MODE=MODE,
+                text_input=text_input,
+                id_input=id_input,
+                repeat_k=repeat_k,
+                payload_repeat=payload_repeat,
+                text_encoding=text_encoding,
+                seed=seed,
+                use_affine_correction=use_affine_correction,
+                alpha_min=args.pareto_alpha_min,
+                alpha_max=args.pareto_alpha_max,
+                alpha_step=args.pareto_alpha_step,
+                n_min=args.pareto_n_min,
+                n_max=args.pareto_n_max,
+                n_step=args.pareto_n_step,
+                n_values=n_values,
+                psnr_min=args.pareto_psnr_min,
+                random_seed=seed,
+            )
+            current_alpha = int(round(best_alpha))
+            N = int(best_n)
+            print(
+                f"[*] Pareto per-image {img_file}: alpha={current_alpha}, N={N} | front_size={len(pareto_front)}"
+            )
+
+        if auto_optimize_alpha_per_image and not auto_optimize_pareto and not auto_optimize_grid:
             best_alpha, best_score, _ = optimize_alpha_bayesian(
                 host_paths=[img_path],
                 wm_raw_path=wm_raw,

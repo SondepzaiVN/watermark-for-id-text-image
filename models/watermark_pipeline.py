@@ -639,21 +639,15 @@ def get_attack_scenarios():
     """Standard attack scenarios used for evaluation."""
     return [
         ("Original_No_Attack", lambda x: x),
-        ("No Attack", lambda x: x),
         ("JPEG_Q90", lambda x: attack_jpeg(x, 90)),
         ("JPEG_QF90", lambda x: attack_jpeg(x, 90)),
         ("JPEG_Q80", lambda x: attack_jpeg(x, 80)),
+        ("JPEG_Q75", lambda x: attack_jpeg(x, 75)),
         ("JPEG_Q70", lambda x: attack_jpeg(x, 70)),
-        ("ZaloCompress_Q85_S0.75", lambda x: attack_zalo_compress(x, 85, 0.75)),
         ("SaltPepper_0.01", lambda x: attack_salt_pepper(x, 0.01)),
-        ("SaltPepperNoise_0.01", lambda x: attack_salt_pepper(x, 0.01)),
         ("SaltPepper_0.05", lambda x: attack_salt_pepper(x, 0.05)),
-        ("SaltPepper_0.1", lambda x: attack_salt_pepper(x, 0.1)),
+        ("SaltPepperNoise_0.01", lambda x: attack_salt_pepper(x, 0.01)),
         ("Sharpening_0.01", lambda x: attack_sharpening(x, 0.01)),
-        ("Average_3x3", lambda x: attack_average_filter(x, 3)),
-        ("AverageFiltering_3x3", lambda x: attack_average_filter(x, 3)),
-        ("Median_3x3", lambda x: attack_median_filter(x, 3)),
-        ("MedianFiltering_3x3", lambda x: attack_median_filter(x, 3)),
         ("Gaussian_3x3_s0.1", lambda x: attack_gaussian_filter(x, 3, 0.1)),
         ("GaussianBlur", lambda x: attack_gaussian_filter(x, 3, 0.8)),
         ("Gaussian_3x3_s0.2", lambda x: attack_gaussian_filter(x, 3, 0.2)),
@@ -945,6 +939,483 @@ def optimize_alpha_bayesian(host_paths, wm_raw_path, MODE, text_input, id_input,
     return best_alpha, best_score, study
 
 
+def _pareto_front(rows, key_x, key_y):
+    front = []
+    for i, r in enumerate(rows):
+        dominated = False
+        for j, s in enumerate(rows):
+            if i == j:
+                continue
+            if (
+                s[key_x] >= r[key_x]
+                and s[key_y] >= r[key_y]
+                and (s[key_x] > r[key_x] or s[key_y] > r[key_y])
+            ):
+                dominated = True
+                break
+        if not dominated:
+            front.append(r)
+    return front
+
+
+def _select_knee_point(front, key_x, key_y):
+    if not front:
+        return None
+    if len(front) == 1:
+        return front[0]
+
+    xs = [r[key_x] for r in front]
+    ys = [r[key_y] for r in front]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+
+    if x_max == x_min or y_max == y_min:
+        return max(front, key=lambda r: (r[key_y], r[key_x]))
+
+    def norm(val, vmin, vmax):
+        return (val - vmin) / (vmax - vmin)
+
+    front_sorted = sorted(front, key=lambda r: r[key_x])
+    x1 = norm(front_sorted[0][key_x], x_min, x_max)
+    y1 = norm(front_sorted[0][key_y], y_min, y_max)
+    x2 = norm(front_sorted[-1][key_x], x_min, x_max)
+    y2 = norm(front_sorted[-1][key_y], y_min, y_max)
+
+    denom = math.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
+    if denom == 0.0:
+        return max(front_sorted, key=lambda r: (r[key_y], r[key_x]))
+
+    best = None
+    best_dist = -1.0
+    for r in front_sorted:
+        x = norm(r[key_x], x_min, x_max)
+        y = norm(r[key_y], y_min, y_max)
+        # Max distance from the line between extremes approximates the knee.
+        dist = abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1) / denom
+        if dist > best_dist:
+            best_dist = dist
+            best = r
+    return best
+
+
+def optimize_pareto_roi_alpha(
+    host_paths,
+    wm_raw_path,
+    MODE,
+    text_input,
+    id_input,
+    repeat_k,
+    payload_repeat,
+    text_encoding,
+    seed,
+    use_affine_correction=False,
+    alpha_min=80.0,
+    alpha_max=120.0,
+    alpha_step=5.0,
+    n_min=6,
+    n_max=14,
+    n_step=2,
+    n_values=None,
+    psnr_min=35.0,
+    attack_names=None,
+    random_seed=42,
+):
+    """Grid search for Pareto-optimal (N, alpha) by PSNR and robustness."""
+    if isinstance(host_paths, str):
+        host_paths = [host_paths]
+    host_paths = list(host_paths)
+    if len(host_paths) == 0:
+        raise ValueError("host_paths is empty.")
+
+    if MODE == "text":
+        wm_bin_raw = text_to_bin_image(
+            text_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            encoding=text_encoding,
+            payload_seed=seed,
+        )
+        wm_raw = wm_bin_raw * 255
+    elif MODE == "id":
+        wm_bin_raw = id_to_bin_image(
+            id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            payload_seed=seed,
+        )
+        wm_raw = wm_bin_raw * 255
+    else:
+        wm_raw = cv2.imread(wm_raw_path, cv2.IMREAD_GRAYSCALE)
+
+    if wm_raw is None:
+        raise ValueError("Unable to read input watermark.")
+
+    orig_h, orig_w = wm_raw.shape
+    wm_padded, _ = pad_watermark(wm_raw, color=255)
+    wm_orig_bin = (wm_raw > 127).astype(np.uint8)
+    wm = (wm_padded > 127).astype(np.uint8)
+
+    all_attacks = get_attack_scenarios()
+    if attack_names:
+        selected_attacks = [(name, fn) for name, fn in all_attacks if name in set(attack_names)]
+        if len(selected_attacks) == 0:
+            raise ValueError("No valid attack found in attack_names.")
+    else:
+        selected_attacks = [
+            ("JPEG_Q80", lambda x: attack_jpeg(x, 80)),
+        ]
+
+    results = []
+    relaxed_results = []
+    alpha_vals = np.arange(alpha_min, alpha_max + 1e-9, alpha_step, dtype=np.float64)
+    if n_values:
+        n_vals = [int(v) for v in n_values if int(v) > 0]
+    else:
+        n_vals = list(range(int(n_min), int(n_max) + 1, int(n_step)))
+    n_vals = sorted(set(n_vals))
+
+    for alpha_val in alpha_vals:
+        stop_alpha = False
+        for n_idx, n_val in enumerate(n_vals):
+            np.random.seed(int(random_seed))
+            psnr_no_attack_vals = []
+            nc_vals, ber_vals = [], []
+            char_acc_vals = []
+            payload_ber_vals = []
+            valid_runs = 0
+
+            for host_idx, host_path in enumerate(host_paths):
+                host = cv2.imread(host_path)
+                if host is None:
+                    continue
+
+                wat, _, pos, safe_des_orig, safe_kp_orig = embed_watermark(
+                    host, wm, alpha_val, n_val, seed
+                )
+                if len(pos) == 0:
+                    continue
+
+                psnr_no_attack_vals.append(float(cv2.PSNR(host, wat)))
+
+                for attack_idx, (_, attack_fn) in enumerate(selected_attacks):
+                    np.random.seed(int(random_seed + host_idx * 100 + attack_idx))
+                    att_img = attack_fn(wat)
+                    ext_padded = extract_watermark(
+                        att_img,
+                        safe_des_orig,
+                        safe_kp_orig,
+                        alpha_val,
+                        pos,
+                        wm.shape,
+                        seed=seed,
+                        use_affine_correction=use_affine_correction,
+                    )
+                    ext = ext_padded[:orig_h, :orig_w]
+
+                    if MODE in ("text", "id"):
+                        if MODE == "text":
+                            extracted_text = bin_image_to_text(
+                                ext,
+                                repeat_k=repeat_k,
+                                payload_repeat=payload_repeat,
+                                encoding=text_encoding,
+                                payload_seed=seed,
+                            )
+                            char_acc = char_accuracy(text_input, extracted_text)
+                            orig_bits = text_to_payload_bits_unshuffled(
+                                text_input,
+                                encoding=text_encoding,
+                            )
+                            extracted_bits = payload_bits_from_bin_image_text(
+                                ext,
+                                repeat_k=repeat_k,
+                                payload_repeat=payload_repeat,
+                                payload_seed=seed,
+                            )
+                            payload_ber_val = payload_ber(orig_bits, extracted_bits)
+                        else:
+                            extracted_id = bin_image_to_id(
+                                ext,
+                                repeat_k=repeat_k,
+                                payload_repeat=payload_repeat,
+                                payload_seed=seed,
+                            )
+                            char_acc = char_accuracy(id_input, extracted_id)
+                            orig_bits = id_to_payload_bits_unshuffled(id_input)
+                            extracted_bits = payload_bits_from_bin_image_id(
+                                ext,
+                                repeat_k=repeat_k,
+                                payload_repeat=payload_repeat,
+                                payload_seed=seed,
+                            )
+                            payload_ber_val = payload_ber(orig_bits, extracted_bits)
+                        char_acc_vals.append(float(char_acc))
+                        payload_ber_vals.append(float(payload_ber_val))
+                    else:
+                        psnr, ssim, nc, ber = evaluate(host, att_img, wm_orig_bin, ext)
+                        nc_vals.append(float(nc))
+                        ber_vals.append(float(ber))
+
+                    valid_runs += 1
+
+            if valid_runs == 0 or len(psnr_no_attack_vals) == 0:
+                continue
+
+            avg_psnr_no_attack = float(np.mean(psnr_no_attack_vals))
+            if avg_psnr_no_attack < psnr_min:
+                # Larger ROI counts and higher alpha usually reduce PSNR further.
+                if n_idx == 0:
+                    stop_alpha = True
+                break
+
+            if MODE in ("text", "id"):
+                avg_char_acc = float(np.mean(char_acc_vals)) if char_acc_vals else 0.0
+                avg_payload_ber = float(np.mean(payload_ber_vals)) if payload_ber_vals else 1.0
+                if avg_payload_ber > 0.0:
+                    # If BER > 0 at this N, skip larger N values for this alpha.
+                    relaxed_results.append(
+                        {
+                            "alpha": float(alpha_val),
+                            "n": int(n_val),
+                            "avg_psnr_no_attack": avg_psnr_no_attack,
+                            "avg_char_acc": avg_char_acc,
+                            "avg_payload_ber": avg_payload_ber,
+                            "robust_score": 1.0 - avg_payload_ber,
+                        }
+                    )
+                    break
+                robust_score = 1.0 - avg_payload_ber
+                result = {
+                    "alpha": float(alpha_val),
+                    "n": int(n_val),
+                    "avg_psnr_no_attack": avg_psnr_no_attack,
+                    "avg_char_acc": avg_char_acc,
+                    "avg_payload_ber": avg_payload_ber,
+                    "robust_score": robust_score,
+                }
+            else:
+                avg_nc = float(np.mean(nc_vals)) if nc_vals else 0.0
+                avg_ber = float(np.mean(ber_vals)) if ber_vals else 1.0
+                robust_score = avg_nc - avg_ber
+                result = {
+                    "alpha": float(alpha_val),
+                    "n": int(n_val),
+                    "avg_psnr_no_attack": avg_psnr_no_attack,
+                    "avg_nc": avg_nc,
+                    "avg_ber": avg_ber,
+                    "robust_score": robust_score,
+                }
+
+            results.append(result)
+
+        if stop_alpha:
+            break
+
+    if not results:
+        if relaxed_results:
+            best_relaxed = min(
+                relaxed_results,
+                key=lambda r: (r["avg_payload_ber"], -r["avg_psnr_no_attack"]),
+            )
+            return float(best_relaxed["alpha"]), int(best_relaxed["n"]), []
+        raise ValueError("No valid Pareto candidates found. Adjust search ranges or thresholds.")
+
+    front = _pareto_front(results, "avg_psnr_no_attack", "robust_score")
+    knee = _select_knee_point(front, "avg_psnr_no_attack", "robust_score")
+    if knee is None:
+        knee = max(results, key=lambda r: (r["robust_score"], r["avg_psnr_no_attack"]))
+
+    return float(knee["alpha"]), int(knee["n"]), front
+
+
+def optimize_roi_alpha_grid(
+    host_paths,
+    wm_raw_path,
+    MODE,
+    text_input,
+    id_input,
+    repeat_k,
+    payload_repeat,
+    text_encoding,
+    seed,
+    use_affine_correction=False,
+    alpha_min=80.0,
+    alpha_max=120.0,
+    alpha_step=2.0,
+    n_values=None,
+    psnr_min=40.0,
+    random_seed=42,
+):
+    """Grid search for (N, alpha) per image with PSNR/BER constraints."""
+    if isinstance(host_paths, str):
+        host_paths = [host_paths]
+    host_paths = list(host_paths)
+    if len(host_paths) == 0:
+        raise ValueError("host_paths is empty.")
+
+    if MODE == "text":
+        wm_bin_raw = text_to_bin_image(
+            text_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            encoding=text_encoding,
+            payload_seed=seed,
+        )
+        wm_raw = wm_bin_raw * 255
+    elif MODE == "id":
+        wm_bin_raw = id_to_bin_image(
+            id_input,
+            repeat_k=repeat_k,
+            payload_repeat=payload_repeat,
+            payload_seed=seed,
+        )
+        wm_raw = wm_bin_raw * 255
+    else:
+        wm_raw = cv2.imread(wm_raw_path, cv2.IMREAD_GRAYSCALE)
+
+    if wm_raw is None:
+        raise ValueError("Unable to read input watermark.")
+
+    orig_h, orig_w = wm_raw.shape
+    wm_padded, _ = pad_watermark(wm_raw, color=255)
+    wm_orig_bin = (wm_raw > 127).astype(np.uint8)
+    wm = (wm_padded > 127).astype(np.uint8)
+
+    attacks = [("JPEG_Q70", lambda x: attack_jpeg(x, 70))]
+
+    alpha_vals = np.arange(alpha_min, alpha_max + 1e-9, alpha_step, dtype=np.float64)
+    if n_values:
+        n_vals = [int(v) for v in n_values if int(v) > 0]
+    else:
+        n_vals = [1, 2, 4, 8, 12, 16, 24]
+    n_vals = sorted(set(n_vals))
+
+    best = None
+    fallback = None
+
+    for alpha_val in alpha_vals:
+        stop_alpha = False
+        for n_idx, n_val in enumerate(n_vals):
+            np.random.seed(int(random_seed))
+            psnr_no_attack_vals = []
+            payload_ber_vals = []
+            nc_vals, ber_vals = [], []
+            valid_runs = 0
+
+            for host_idx, host_path in enumerate(host_paths):
+                host = cv2.imread(host_path)
+                if host is None:
+                    continue
+
+                wat, _, pos, safe_des_orig, safe_kp_orig = embed_watermark(
+                    host, wm, alpha_val, n_val, seed
+                )
+                if len(pos) == 0:
+                    continue
+
+                psnr_no_attack_vals.append(float(cv2.PSNR(host, wat)))
+
+                for attack_idx, (_, attack_fn) in enumerate(attacks):
+                    np.random.seed(int(random_seed + host_idx * 100 + attack_idx))
+                    att_img = attack_fn(wat)
+                    ext_padded = extract_watermark(
+                        att_img,
+                        safe_des_orig,
+                        safe_kp_orig,
+                        alpha_val,
+                        pos,
+                        wm.shape,
+                        seed=seed,
+                        use_affine_correction=use_affine_correction,
+                    )
+                    ext = ext_padded[:orig_h, :orig_w]
+
+                    if MODE in ("text", "id"):
+                        if MODE == "text":
+                            orig_bits = text_to_payload_bits_unshuffled(
+                                text_input,
+                                encoding=text_encoding,
+                            )
+                            extracted_bits = payload_bits_from_bin_image_text(
+                                ext,
+                                repeat_k=repeat_k,
+                                payload_repeat=payload_repeat,
+                                payload_seed=seed,
+                            )
+                        else:
+                            orig_bits = id_to_payload_bits_unshuffled(id_input)
+                            extracted_bits = payload_bits_from_bin_image_id(
+                                ext,
+                                repeat_k=repeat_k,
+                                payload_repeat=payload_repeat,
+                                payload_seed=seed,
+                            )
+                        payload_ber_vals.append(float(payload_ber(orig_bits, extracted_bits)))
+                    else:
+                        psnr, ssim, nc, ber = evaluate(host, att_img, wm_orig_bin, ext)
+                        nc_vals.append(float(nc))
+                        ber_vals.append(float(ber))
+
+                    valid_runs += 1
+
+            if valid_runs == 0 or len(psnr_no_attack_vals) == 0:
+                continue
+
+            avg_psnr_no_attack = float(np.mean(psnr_no_attack_vals))
+            if avg_psnr_no_attack < psnr_min:
+                if n_idx == 0:
+                    stop_alpha = True
+                break
+
+            if MODE in ("text", "id"):
+                avg_payload_ber = float(np.mean(payload_ber_vals)) if payload_ber_vals else 1.0
+                candidate = {
+                    "alpha": float(alpha_val),
+                    "n": int(n_val),
+                    "avg_psnr_no_attack": avg_psnr_no_attack,
+                    "avg_payload_ber": avg_payload_ber,
+                }
+
+                if avg_payload_ber > 0.0:
+                    if fallback is None or (
+                        avg_payload_ber < fallback["avg_payload_ber"]
+                        or (
+                            avg_payload_ber == fallback["avg_payload_ber"]
+                            and avg_psnr_no_attack > fallback["avg_psnr_no_attack"]
+                        )
+                    ):
+                        fallback = candidate
+                    continue
+
+                if best is None or avg_psnr_no_attack > best["avg_psnr_no_attack"]:
+                    best = candidate
+            else:
+                avg_nc = float(np.mean(nc_vals)) if nc_vals else 0.0
+                avg_ber = float(np.mean(ber_vals)) if ber_vals else 1.0
+                robust_score = avg_nc - avg_ber
+                candidate = {
+                    "alpha": float(alpha_val),
+                    "n": int(n_val),
+                    "avg_psnr_no_attack": avg_psnr_no_attack,
+                    "robust_score": robust_score,
+                }
+                if best is None or robust_score > best["robust_score"]:
+                    best = candidate
+
+            if stop_alpha:
+                break
+
+        if stop_alpha:
+            break
+
+    if best is None:
+        if fallback is None:
+            raise ValueError("No valid grid candidates found. Adjust ranges or thresholds.")
+        return float(fallback["alpha"]), int(fallback["n"])
+
+    return float(best["alpha"]), int(best["n"])
+
+
 
 
 # --- 7. EVALUATION FUNCTIONS ---
@@ -1086,6 +1557,16 @@ def text_to_payload_bits(text, encoding="utf-8", payload_seed=None):
     payload_bits = shuffle_bits(payload_bits, payload_seed)
     return header + payload_bits
 
+
+def text_to_payload_bits_unshuffled(text, encoding="utf-8"):
+    payload = text.encode(encoding)
+    payload_len = len(payload)
+    if payload_len > 65535:
+        raise ValueError("Text payload too long for 16-bit length header.")
+    header = format(payload_len, '016b')
+    payload_bits = bytes_to_bit_string(payload)
+    return header + payload_bits
+
 def id_to_payload_bits(id_text, payload_seed=None):
     if id_text is None:
         raise ValueError("ID input is required for mode=id.")
@@ -1096,6 +1577,18 @@ def id_to_payload_bits(id_text, payload_seed=None):
     digits = [int(ch) for ch in id_text]
     bits = ''.join(format(d, '04b') for d in digits)
     bits = shuffle_bits(bits, payload_seed)
+    return bits + '1111'
+
+
+def id_to_payload_bits_unshuffled(id_text):
+    if id_text is None:
+        raise ValueError("ID input is required for mode=id.")
+    if len(id_text) == 0:
+        raise ValueError("ID input cannot be empty.")
+    if not id_text.isdigit():
+        raise ValueError("ID input must contain digits only (0-9).")
+    digits = [int(ch) for ch in id_text]
+    bits = ''.join(format(d, '04b') for d in digits)
     return bits + '1111'
 
 def payload_bits_from_bin_image_text(bin_img, repeat_k=3, payload_repeat=1, payload_seed=None):
@@ -1570,7 +2063,7 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                 extracted_text_clean = sanitize_excel_text(extracted_text)
                 # Character-level accuracy vs input
                 char_acc = char_accuracy(text_input, extracted_text_clean)
-                orig_bits = text_to_payload_bits(text_input, encoding=text_encoding, payload_seed=seed)
+                orig_bits = text_to_payload_bits_unshuffled(text_input, encoding=text_encoding)
                 extracted_bits = payload_bits_from_bin_image_text(
                     ext,
                     repeat_k=repeat_k,
@@ -1594,7 +2087,7 @@ def main(host_path, wm_raw_path, MODE, text_input, id_input, repeat_k, payload_r
                 )
                 extracted_id_clean = sanitize_excel_text(extracted_id)
                 char_acc = char_accuracy(id_input, extracted_id_clean)
-                orig_bits = id_to_payload_bits(id_input, payload_seed=seed)
+                orig_bits = id_to_payload_bits_unshuffled(id_input)
                 extracted_bits = payload_bits_from_bin_image_id(
                     ext,
                     repeat_k=repeat_k,
@@ -1733,10 +2226,9 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
             )
             extracted_text_clean = sanitize_excel_text(extracted_text)
             char_acc = char_accuracy(key.get("text_input", ""), extracted_text_clean)
-            orig_bits = text_to_payload_bits(
+            orig_bits = text_to_payload_bits_unshuffled(
                 key.get("text_input", ""),
                 encoding=key["text_encoding"],
-                payload_seed=key.get("seed"),
             )
             extracted_bits = payload_bits_from_bin_image_text(
                 ext,
@@ -1761,7 +2253,7 @@ def extract_only(host_path, key_path, output_dir, use_affine_correction=False):
             )
             extracted_id_clean = sanitize_excel_text(extracted_id)
             char_acc = char_accuracy(key.get("id_input", ""), extracted_id_clean)
-            orig_bits = id_to_payload_bits(key.get("id_input", ""), payload_seed=key.get("seed"))
+            orig_bits = id_to_payload_bits_unshuffled(key.get("id_input", ""))
             extracted_bits = payload_bits_from_bin_image_id(
                 ext,
                 repeat_k=key["repeat_k"],
